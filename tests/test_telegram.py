@@ -88,6 +88,36 @@ class TestConfigure(unittest.TestCase):
         self.assertIsNone(self.t._bot_token)
         self.assertIsNone(self.t._chat_id)
 
+    def test_reads_direct_bot_token_from_config(self):
+        env = self._clean_env()
+        with patch.dict(os.environ, env, clear=True):
+            self.t.configure({"bot_token": "direct-tok", "chat_id": "direct-chat"})
+        self.assertEqual(self.t._bot_token, "direct-tok")
+        self.assertEqual(self.t._chat_id, "direct-chat")
+
+    def test_direct_config_takes_priority_over_env(self):
+        env = self._clean_env()
+        env["TELEGRAM_BOT_TOKEN"] = "env-tok"
+        env["TELEGRAM_CHAT_ID"] = "env-chat"
+        with patch.dict(os.environ, env, clear=True):
+            self.t.configure({"bot_token": "config-tok", "chat_id": "config-chat"})
+        self.assertEqual(self.t._bot_token, "config-tok")
+        self.assertEqual(self.t._chat_id, "config-chat")
+
+    def test_missing_chat_id_in_direct_config_disables_plugin(self):
+        env = self._clean_env()
+        with patch.dict(os.environ, env, clear=True):
+            self.t.configure({"bot_token": "direct-tok"})
+        self.assertIsNone(self.t._bot_token)
+        self.assertIsNone(self.t._chat_id)
+
+    def test_missing_bot_token_in_direct_config_disables_plugin(self):
+        env = self._clean_env()
+        with patch.dict(os.environ, env, clear=True):
+            self.t.configure({"chat_id": "direct-chat"})
+        self.assertIsNone(self.t._bot_token)
+        self.assertIsNone(self.t._chat_id)
+
 
 class TestOnInbound(unittest.TestCase):
     def setUp(self):

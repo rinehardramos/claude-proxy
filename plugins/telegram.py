@@ -24,19 +24,35 @@ def plugin_info() -> dict:
 
 
 def configure(config: dict) -> None:
-    """Called once at load time with the plugin's config section from plugins.toml."""
+    """Called once at load time with the plugin's config section from plugins.toml.
+
+    Credential resolution order (first match wins):
+      1. Direct values:  bot_token = "..." / chat_id = "..."  in plugins.toml
+      2. Env var names:  bot_token_env = "VAR" / chat_id_env = "VAR"  in plugins.toml
+      3. Default env vars: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+    """
     global _bot_token, _chat_id
 
-    token_env = config.get("bot_token_env", "TELEGRAM_BOT_TOKEN")
-    chat_env = config.get("chat_id_env", "TELEGRAM_CHAT_ID")
+    # 1. Direct values in config
+    _bot_token = config.get("bot_token")
+    _chat_id = config.get("chat_id")
 
-    _bot_token = os.environ.get(token_env)
-    _chat_id = os.environ.get(chat_env)
+    # 2/3. Fall back to env var lookup
+    if not _bot_token:
+        token_env = config.get("bot_token_env", "TELEGRAM_BOT_TOKEN")
+        _bot_token = os.environ.get(token_env)
+    if not _chat_id:
+        chat_env = config.get("chat_id_env", "TELEGRAM_CHAT_ID")
+        _chat_id = os.environ.get(chat_env)
 
     if not _bot_token or not _chat_id:
-        missing = [v for v, val in [(token_env, _bot_token), (chat_env, _chat_id)] if not val]
+        missing = []
+        if not _bot_token:
+            missing.append("bot_token / " + config.get("bot_token_env", "TELEGRAM_BOT_TOKEN"))
+        if not _chat_id:
+            missing.append("chat_id / " + config.get("chat_id_env", "TELEGRAM_CHAT_ID"))
         print(
-            f"[telegram] WARNING: env var(s) not set: {', '.join(missing)} — plugin disabled",
+            f"[telegram] WARNING: credentials not found: {', '.join(missing)} — plugin disabled",
             file=sys.stderr,
         )
         _bot_token = None

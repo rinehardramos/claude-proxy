@@ -31,12 +31,26 @@ _DEFAULT_PLUGINS_TOML = """\
 # Each plugin must exist as a .py file in ~/.claude/claude-proxy/plugins/
 enabled = []
 
-# Example: enable the Telegram notification plugin
+# ── Telegram notifications ──────────────────────────────────────────────────
+# Sends a summary to Telegram after each Claude response.
+#
+# Option A — credentials directly in this file (simplest):
+#
 # enabled = ["telegram"]
 #
 # [telegram]
-# bot_token_env = "TELEGRAM_BOT_TOKEN"
-# chat_id_env = "TELEGRAM_CHAT_ID"
+# bot_token = "your-bot-token-here"
+# chat_id   = "your-chat-id-here"
+#
+# Option B — credentials via environment variables (better for shared machines):
+#
+# enabled = ["telegram"]
+#
+# [telegram]
+# bot_token_env = "TELEGRAM_BOT_TOKEN"   # default, can omit
+# chat_id_env   = "TELEGRAM_CHAT_ID"     # default, can omit
+#
+# Resolution order: direct value → env var name → default env var name
 """
 
 _SHELL_BLOCK = """\
