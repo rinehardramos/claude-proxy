@@ -3,20 +3,30 @@ claude-proxy installer — global setup for Claude Code integration.
 
 Usage:
     python3 install.py           # install
-    python3 install.py uninstall # remove proxy hook from settings + shell profile note
+    python3 install.py uninstall # full removal: kill proxy, delete runtime dir,
+                                 # remove settings hook, remove shell profile block
 
-What it does:
+What it does (install):
   1. Creates ~/.claude/claude-proxy/{plugins,sideload/inbound,sideload/outbound}
   2. Copies plugins/*.py → ~/.claude/claude-proxy/plugins/
   3. Writes a starter plugins.toml (skips if already present)
-  4. Patches ~/.claude/settings.json — adds a SessionStart hook that launches
-     proxy.py --daemon on Claude Code startup
-  5. Patches your shell profile — adds ANTHROPIC_BASE_URL=http://127.0.0.1:18019
+  4. Patches ~/.claude/settings.json — SessionStart hook starts proxy on session open
+  5. Patches shell profile — starts proxy + conditionally exports ANTHROPIC_BASE_URL
+     (only exported when the proxy is confirmed healthy = automatic direct fallback)
+
+What it does (uninstall):
+  1. Sends SIGTERM to running proxy via PID file
+  2. Removes ~/.claude/claude-proxy/ entirely
+  3. Removes SessionStart hook from settings.json
+  4. Removes the claude-proxy block from your shell profile
 """
 from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
+import signal
 import sys
 from pathlib import Path
 
@@ -24,6 +34,23 @@ from pathlib import Path
 
 HOOK_MARKER = "claude-proxy"
 SESSION_START_HOOK_COMMAND = "python3 {proxy_py} --daemon 2>/dev/null || true  # {marker}"
+
+# Shell profile block template.
+# Starts the proxy, then polls /proxy-status for up to 1.5 s.
+# ANTHROPIC_BASE_URL is only exported when the proxy is confirmed healthy —
+# if the proxy fails to start, the variable is left unset and Claude Code
+# talks directly to api.anthropic.com (graceful fallback).
+_SHELL_BLOCK_TEMPLATE = """\
+
+# {marker} — route Claude Code through local proxy
+python3 {proxy_py} --daemon 2>/dev/null
+_cp=0; while [ "$_cp" -lt 5 ]; do
+  curl -sf http://127.0.0.1:18019/proxy-status >/dev/null 2>&1 \\
+    && export ANTHROPIC_BASE_URL=http://127.0.0.1:18019 && break
+  sleep 0.3; _cp=$((_cp+1))
+done; unset _cp
+# end {marker}
+"""
 
 _DEFAULT_PLUGINS_TOML = """\
 # claude-proxy plugin configuration
@@ -52,14 +79,6 @@ enabled = []
 #
 # Resolution order: direct value → env var name → default env var name
 """
-
-_SHELL_BLOCK = """\
-
-# {marker} — route Claude Code through local proxy
-export ANTHROPIC_BASE_URL=http://127.0.0.1:18019
-# end {marker}
-""".format(marker=HOOK_MARKER)
-
 
 # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -156,12 +175,49 @@ def detect_shell_profile() -> Path:
     return home / ".zshrc"
 
 
-def patch_shell_profile(profile: Path) -> None:
-    """Append ANTHROPIC_BASE_URL export to the shell profile — idempotent."""
+def patch_shell_profile(profile: Path, proxy_py: Path) -> None:
+    """Append proxy start + conditional ANTHROPIC_BASE_URL to the shell profile.
+
+    Idempotent — does nothing if the marker is already present.
+    ANTHROPIC_BASE_URL is only exported when the proxy health check passes,
+    so Claude Code falls back to api.anthropic.com directly if the proxy
+    fails to start.
+    """
     existing = profile.read_text(encoding="utf-8") if profile.exists() else ""
     if HOOK_MARKER in existing:
         return
-    profile.write_text(existing + _SHELL_BLOCK, encoding="utf-8")
+    block = _SHELL_BLOCK_TEMPLATE.format(marker=HOOK_MARKER, proxy_py=str(proxy_py))
+    profile.write_text(existing + block, encoding="utf-8")
+
+
+def unpatch_shell_profile(profile: Path) -> None:
+    """Remove the claude-proxy block from the shell profile — idempotent."""
+    if not profile.exists():
+        return
+    text = profile.read_text(encoding="utf-8")
+    if HOOK_MARKER not in text:
+        return
+    pattern = (
+        r"\n# " + re.escape(HOOK_MARKER) + r".*?# end " + re.escape(HOOK_MARKER) + r"\n"
+    )
+    cleaned = re.sub(pattern, "", text, flags=re.DOTALL)
+    profile.write_text(cleaned, encoding="utf-8")
+
+
+def kill_proxy(state_dir: Path) -> None:
+    """Send SIGTERM to the running proxy via its PID file, then remove the file."""
+    pid_file = state_dir / "proxy.pid"
+    if not pid_file.exists():
+        return
+    try:
+        pid = int(pid_file.read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+    except (ValueError, ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        pid_file.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 # ── Install / Uninstall orchestration ─────────────────────────────────────
@@ -193,7 +249,7 @@ def install(
     patch_settings_json(settings_path, proxy_py)
 
     print(f"[claude-proxy] Patching {shell_profile}...")
-    patch_shell_profile(shell_profile)
+    patch_shell_profile(shell_profile, proxy_py)
 
     print("""
 [claude-proxy] Installation complete.
@@ -210,25 +266,29 @@ To enable Telegram notifications:
 
 
 def uninstall(
+    state_dir: Path | None = None,
     settings_path: Path | None = None,
     shell_profile: Path | None = None,
 ) -> None:
-    """Remove the proxy hook from settings.json."""
+    """Full removal: kill proxy, delete runtime dir, clean settings + shell profile."""
+    state_dir = state_dir or Path("~/.claude/claude-proxy").expanduser()
     settings_path = settings_path or Path("~/.claude/settings.json").expanduser()
     shell_profile = shell_profile or detect_shell_profile()
+
+    print("[claude-proxy] Stopping proxy...")
+    kill_proxy(state_dir)
+
+    print(f"[claude-proxy] Removing runtime directory {state_dir}...")
+    if state_dir.exists():
+        shutil.rmtree(state_dir)
 
     print(f"[claude-proxy] Removing hook from {settings_path}...")
     unpatch_settings_json(settings_path)
 
-    print(f"""
-[claude-proxy] Hook removed from settings.json.
+    print(f"[claude-proxy] Removing shell profile block from {shell_profile}...")
+    unpatch_shell_profile(shell_profile)
 
-Manual step — remove these lines from {shell_profile}:
-
-    # {HOOK_MARKER} — route Claude Code through local proxy
-    export ANTHROPIC_BASE_URL=http://127.0.0.1:18019
-    # end {HOOK_MARKER}
-""")
+    print(f"\n[claude-proxy] Uninstalled. Reload your shell:  source {shell_profile}")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────

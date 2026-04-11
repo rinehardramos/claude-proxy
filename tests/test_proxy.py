@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+import proxy as _proxy_mod
 from proxy import (
     _parse_plugins_toml,
     load_plugins,
@@ -500,6 +501,34 @@ class TestHealthEndpoint(unittest.TestCase):
         h = self._make_handler()
         h._health()
         h.send_response.assert_called_once_with(200)
+
+
+# ── main() dedup guard ─────────────────────────────────────────────────────
+
+class TestMainDedup(unittest.TestCase):
+    def test_exits_0_silently_when_proxy_already_running(self):
+        """main() must not start a second instance — exit 0 if already running."""
+        with unittest.mock.patch.object(_proxy_mod, "is_proxy_running", return_value=True):
+            with unittest.mock.patch("sys.argv", ["proxy.py"]):
+                with self.assertRaises(SystemExit) as cm:
+                    _proxy_mod.main()
+        self.assertEqual(cm.exception.code, 0)
+
+    def test_does_not_exit_when_proxy_not_running(self):
+        """main() must proceed when no instance is running."""
+        # We stop it after argparse so we don't actually bind to a port.
+        class _StopEarly(Exception):
+            pass
+
+        def _fake_server(*a, **kw):
+            raise _StopEarly
+
+        with unittest.mock.patch.object(_proxy_mod, "is_proxy_running", return_value=False):
+            with unittest.mock.patch("sys.argv", ["proxy.py"]):
+                with unittest.mock.patch.object(_proxy_mod, "ThreadedHTTPServer", side_effect=_StopEarly):
+                    with unittest.mock.patch.object(_proxy_mod, "_write_pid"):
+                        with self.assertRaises(_StopEarly):
+                            _proxy_mod.main()
 
 
 if __name__ == "__main__":

@@ -641,6 +641,11 @@ def main():
     args = parser.parse_args()
     port = args.port
 
+    # Dedup guard — silently exit if an instance is already running.
+    # Allows SessionStart hook to fire on every Claude Code window safely.
+    if is_proxy_running():
+        sys.exit(0)
+
     if args.daemon:
         pid = os.fork()
         if pid > 0:

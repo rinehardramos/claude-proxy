@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import signal
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from install import (
@@ -17,6 +19,8 @@ from install import (
     patch_settings_json,
     unpatch_settings_json,
     patch_shell_profile,
+    unpatch_shell_profile,
+    kill_proxy,
     detect_shell_profile,
     HOOK_MARKER,
     SESSION_START_HOOK_COMMAND,
@@ -269,36 +273,54 @@ class TestPatchShellProfile(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.profile = Path(self.tmp) / ".zshrc"
+        self.proxy_py = Path(self.tmp) / "proxy.py"
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_creates_profile_if_missing(self):
-        patch_shell_profile(self.profile)
+        patch_shell_profile(self.profile, self.proxy_py)
         self.assertTrue(self.profile.exists())
 
     def test_appends_anthropic_base_url_export(self):
-        patch_shell_profile(self.profile)
+        patch_shell_profile(self.profile, self.proxy_py)
         self.assertIn("ANTHROPIC_BASE_URL", self.profile.read_text())
 
     def test_appends_correct_url(self):
-        patch_shell_profile(self.profile)
+        patch_shell_profile(self.profile, self.proxy_py)
         self.assertIn("http://127.0.0.1:18019", self.profile.read_text())
 
     def test_idempotent_does_not_duplicate(self):
-        patch_shell_profile(self.profile)
-        patch_shell_profile(self.profile)
+        patch_shell_profile(self.profile, self.proxy_py)
+        patch_shell_profile(self.profile, self.proxy_py)
         count = self.profile.read_text().count("ANTHROPIC_BASE_URL")
         self.assertEqual(count, 1)
 
     def test_preserves_existing_content(self):
         self.profile.write_text("export EDITOR=vim\n")
-        patch_shell_profile(self.profile)
+        patch_shell_profile(self.profile, self.proxy_py)
         self.assertIn("EDITOR=vim", self.profile.read_text())
 
     def test_has_marker_to_identify_block(self):
-        patch_shell_profile(self.profile)
+        patch_shell_profile(self.profile, self.proxy_py)
         self.assertIn(HOOK_MARKER, self.profile.read_text())
+
+    def test_block_starts_proxy_daemon(self):
+        patch_shell_profile(self.profile, self.proxy_py)
+        text = self.profile.read_text()
+        self.assertIn(str(self.proxy_py), text)
+        self.assertIn("--daemon", text)
+
+    def test_url_is_conditional_on_health_check(self):
+        """ANTHROPIC_BASE_URL must only be exported if the proxy is healthy."""
+        patch_shell_profile(self.profile, self.proxy_py)
+        text = self.profile.read_text()
+        # The export line must follow a health check, not be unconditional
+        export_pos = text.find("export ANTHROPIC_BASE_URL")
+        curl_pos = text.find("proxy-status")
+        self.assertGreater(export_pos, 0)
+        self.assertGreater(curl_pos, 0)
+        self.assertLess(curl_pos, export_pos)  # health check comes before export
 
 
 # ── detect_shell_profile ───────────────────────────────────────────────────
@@ -321,6 +343,156 @@ class TestDetectShellProfile(unittest.TestCase):
         with patch.dict("os.environ", {"SHELL": "/bin/fish"}, clear=False):
             p = detect_shell_profile()
         self.assertTrue(str(p).endswith(".zshrc"))
+
+
+# ── unpatch_shell_profile ──────────────────────────────────────────────────
+
+class TestUnpatchShellProfile(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.profile = Path(self.tmp) / ".zshrc"
+        self.proxy_py = Path(self.tmp) / "proxy.py"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _install(self):
+        patch_shell_profile(self.profile, self.proxy_py)
+
+    def test_removes_marker_block(self):
+        self._install()
+        unpatch_shell_profile(self.profile)
+        self.assertNotIn(HOOK_MARKER, self.profile.read_text())
+
+    def test_removes_anthropic_base_url(self):
+        self._install()
+        unpatch_shell_profile(self.profile)
+        self.assertNotIn("ANTHROPIC_BASE_URL", self.profile.read_text())
+
+    def test_preserves_content_before_block(self):
+        self.profile.write_text("export EDITOR=vim\n")
+        self._install()
+        unpatch_shell_profile(self.profile)
+        self.assertIn("EDITOR=vim", self.profile.read_text())
+
+    def test_preserves_content_after_block(self):
+        self._install()
+        self.profile.write_text(self.profile.read_text() + "export FOO=bar\n")
+        unpatch_shell_profile(self.profile)
+        self.assertIn("FOO=bar", self.profile.read_text())
+
+    def test_noop_when_marker_absent(self):
+        self.profile.write_text("export EDITOR=vim\n")
+        unpatch_shell_profile(self.profile)  # should not raise
+        self.assertIn("EDITOR=vim", self.profile.read_text())
+
+    def test_noop_when_profile_missing(self):
+        unpatch_shell_profile(self.profile)  # should not raise
+
+    def test_idempotent(self):
+        self._install()
+        unpatch_shell_profile(self.profile)
+        unpatch_shell_profile(self.profile)  # second call should not raise or corrupt
+
+
+# ── kill_proxy ─────────────────────────────────────────────────────────────
+
+class TestKillProxy(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.state_dir = Path(self.tmp)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_pid(self, pid: int):
+        (self.state_dir / "proxy.pid").write_text(str(pid))
+
+    def test_sends_sigterm_to_pid_from_file(self):
+        self._write_pid(99999)
+        with patch("os.kill") as mock_kill:
+            mock_kill.side_effect = [None]  # SIGTERM succeeds
+            kill_proxy(self.state_dir)
+        mock_kill.assert_called_once_with(99999, signal.SIGTERM)
+
+    def test_removes_pid_file_after_kill(self):
+        self._write_pid(99999)
+        with patch("os.kill"):
+            kill_proxy(self.state_dir)
+        self.assertFalse((self.state_dir / "proxy.pid").exists())
+
+    def test_noop_when_no_pid_file(self):
+        kill_proxy(self.state_dir)  # should not raise
+
+    def test_handles_dead_process_gracefully(self):
+        self._write_pid(99999)
+        with patch("os.kill", side_effect=ProcessLookupError):
+            kill_proxy(self.state_dir)  # should not raise
+        self.assertFalse((self.state_dir / "proxy.pid").exists())
+
+    def test_handles_permission_error_gracefully(self):
+        self._write_pid(99999)
+        with patch("os.kill", side_effect=PermissionError):
+            kill_proxy(self.state_dir)  # should not raise
+
+
+# ── uninstall (full) ───────────────────────────────────────────────────────
+
+class TestUninstallFull(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.state_dir = Path(self.tmp) / "claude-proxy"
+        self.state_dir.mkdir()
+        self.settings = Path(self.tmp) / "settings.json"
+        self.profile = Path(self.tmp) / ".zshrc"
+        self.proxy_py = Path(self.tmp) / "proxy.py"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _full_install(self):
+        patch_settings_json(self.settings, self.proxy_py)
+        patch_shell_profile(self.profile, self.proxy_py)
+
+    def _uninstall(self):
+        from install import uninstall
+        uninstall(
+            state_dir=self.state_dir,
+            settings_path=self.settings,
+            shell_profile=self.profile,
+        )
+
+    def test_removes_state_dir(self):
+        self._full_install()
+        self._uninstall()
+        self.assertFalse(self.state_dir.exists())
+
+    def test_removes_settings_hook(self):
+        self._full_install()
+        self._uninstall()
+        data = json.loads(self.settings.read_text())
+        hooks = data.get("hooks", {}).get("SessionStart", [])
+        self.assertEqual(len([h for h in hooks if HOOK_MARKER in json.dumps(h)]), 0)
+
+    def test_removes_shell_profile_block(self):
+        self._full_install()
+        self._uninstall()
+        self.assertNotIn(HOOK_MARKER, self.profile.read_text())
+
+    def test_tolerates_missing_state_dir(self):
+        self._full_install()
+        shutil.rmtree(self.state_dir)
+        self._uninstall()  # should not raise
+
+    def test_tolerates_missing_settings(self):
+        self._full_install()
+        self.settings.unlink()
+        self._uninstall()  # should not raise
+
+    def test_tolerates_missing_profile(self):
+        self._full_install()
+        self.profile.unlink()
+        self._uninstall()  # should not raise
 
 
 if __name__ == "__main__":
