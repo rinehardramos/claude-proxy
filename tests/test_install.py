@@ -506,5 +506,217 @@ class TestUninstallFull(unittest.TestCase):
         self._uninstall()  # should not raise
 
 
+# ── enable_plugin ─────────────────────────────────────────────────────────
+
+class TestEnablePlugin(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.state_dir = Path(self.tmp) / "claude-proxy"
+        self.state_dir.mkdir()
+        (self.state_dir / "plugins").mkdir()
+        self.project_dir = Path(self.tmp) / "project"
+        self.project_dir.mkdir()
+        (self.project_dir / "plugins").mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_copies_plugin_py_to_runtime(self):
+        (self.project_dir / "plugins" / "telegram.py").write_text("# plugin")
+        (self.project_dir / "plugins" / "telegram.toml").write_text("enabled = false")
+        from install import enable_plugin
+        enable_plugin(self.state_dir, self.project_dir, "telegram")
+        self.assertTrue((self.state_dir / "plugins" / "telegram.py").exists())
+
+    def test_copies_plugin_toml_to_runtime(self):
+        (self.project_dir / "plugins" / "telegram.py").write_text("# plugin")
+        (self.project_dir / "plugins" / "telegram.toml").write_text("enabled = false")
+        from install import enable_plugin
+        enable_plugin(self.state_dir, self.project_dir, "telegram")
+        self.assertTrue((self.state_dir / "plugins" / "telegram.toml").exists())
+
+    def test_sets_enabled_true_in_toml(self):
+        (self.project_dir / "plugins" / "telegram.py").write_text("# plugin")
+        (self.project_dir / "plugins" / "telegram.toml").write_text("enabled = false")
+        from install import enable_plugin
+        enable_plugin(self.state_dir, self.project_dir, "telegram")
+        content = (self.state_dir / "plugins" / "telegram.toml").read_text()
+        self.assertIn("enabled = true", content)
+        self.assertNotIn("enabled = false", content)
+
+    def test_preserves_other_toml_config(self):
+        (self.project_dir / "plugins" / "telegram.py").write_text("# plugin")
+        toml = 'enabled = false\nbot_token = "tok123"\nchat_id = "42"'
+        (self.project_dir / "plugins" / "telegram.toml").write_text(toml)
+        from install import enable_plugin
+        enable_plugin(self.state_dir, self.project_dir, "telegram")
+        content = (self.state_dir / "plugins" / "telegram.toml").read_text()
+        self.assertIn('bot_token = "tok123"', content)
+        self.assertIn('chat_id = "42"', content)
+
+    def test_does_not_overwrite_existing_toml(self):
+        """User's existing config should not be lost — only enabled flag changes."""
+        (self.project_dir / "plugins" / "telegram.py").write_text("# plugin")
+        (self.project_dir / "plugins" / "telegram.toml").write_text("enabled = false")
+        (self.state_dir / "plugins" / "telegram.toml").write_text(
+            'enabled = false\nbot_token = "my-secret"'
+        )
+        from install import enable_plugin
+        enable_plugin(self.state_dir, self.project_dir, "telegram")
+        content = (self.state_dir / "plugins" / "telegram.toml").read_text()
+        self.assertIn("enabled = true", content)
+        self.assertIn('bot_token = "my-secret"', content)
+
+    def test_raises_for_unknown_plugin(self):
+        from install import enable_plugin
+        with self.assertRaises(FileNotFoundError):
+            enable_plugin(self.state_dir, self.project_dir, "nonexistent")
+
+    def test_adds_enabled_line_if_missing(self):
+        (self.project_dir / "plugins" / "myplugin.py").write_text("# plugin")
+        (self.project_dir / "plugins" / "myplugin.toml").write_text("# no enabled line\n")
+        from install import enable_plugin
+        enable_plugin(self.state_dir, self.project_dir, "myplugin")
+        content = (self.state_dir / "plugins" / "myplugin.toml").read_text()
+        self.assertIn("enabled = true", content)
+
+    def test_plugin_without_toml_gets_one_created(self):
+        (self.project_dir / "plugins" / "bare.py").write_text("# plugin")
+        from install import enable_plugin
+        enable_plugin(self.state_dir, self.project_dir, "bare")
+        toml_path = self.state_dir / "plugins" / "bare.toml"
+        self.assertTrue(toml_path.exists())
+        self.assertIn("enabled = true", toml_path.read_text())
+
+
+# ── disable_plugin ────────────────────────────────────────────────────────
+
+class TestDisablePlugin(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.state_dir = Path(self.tmp) / "claude-proxy"
+        self.state_dir.mkdir()
+        (self.state_dir / "plugins").mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_sets_enabled_false_in_toml(self):
+        (self.state_dir / "plugins" / "telegram.toml").write_text("enabled = true")
+        from install import disable_plugin
+        disable_plugin(self.state_dir, "telegram")
+        content = (self.state_dir / "plugins" / "telegram.toml").read_text()
+        self.assertIn("enabled = false", content)
+        self.assertNotIn("enabled = true", content)
+
+    def test_preserves_other_config(self):
+        toml = 'enabled = true\nbot_token = "tok"\nchat_id = "42"'
+        (self.state_dir / "plugins" / "telegram.toml").write_text(toml)
+        from install import disable_plugin
+        disable_plugin(self.state_dir, "telegram")
+        content = (self.state_dir / "plugins" / "telegram.toml").read_text()
+        self.assertIn('bot_token = "tok"', content)
+
+    def test_noop_when_already_disabled(self):
+        toml = "enabled = false\n"
+        (self.state_dir / "plugins" / "telegram.toml").write_text(toml)
+        from install import disable_plugin
+        disable_plugin(self.state_dir, "telegram")
+        content = (self.state_dir / "plugins" / "telegram.toml").read_text()
+        self.assertIn("enabled = false", content)
+
+    def test_raises_for_unknown_plugin(self):
+        from install import disable_plugin
+        with self.assertRaises(FileNotFoundError):
+            disable_plugin(self.state_dir, "nonexistent")
+
+    def test_does_not_delete_plugin_files(self):
+        (self.state_dir / "plugins" / "telegram.py").write_text("# plugin")
+        (self.state_dir / "plugins" / "telegram.toml").write_text("enabled = true")
+        from install import disable_plugin
+        disable_plugin(self.state_dir, "telegram")
+        self.assertTrue((self.state_dir / "plugins" / "telegram.py").exists())
+
+
+# ── list_plugins ──────────────────────────────────────────────────────────
+
+class TestListPlugins(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.state_dir = Path(self.tmp) / "claude-proxy"
+        self.state_dir.mkdir()
+        (self.state_dir / "plugins").mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_returns_empty_list_when_no_plugins(self):
+        from install import list_plugins
+        result = list_plugins(self.state_dir)
+        self.assertEqual(result, [])
+
+    def test_returns_plugin_with_enabled_status(self):
+        (self.state_dir / "plugins" / "telegram.py").write_text("# plugin")
+        (self.state_dir / "plugins" / "telegram.toml").write_text("enabled = true")
+        from install import list_plugins
+        result = list_plugins(self.state_dir)
+        self.assertEqual(result, [("telegram", True)])
+
+    def test_returns_disabled_plugin(self):
+        (self.state_dir / "plugins" / "telegram.py").write_text("# plugin")
+        (self.state_dir / "plugins" / "telegram.toml").write_text("enabled = false")
+        from install import list_plugins
+        result = list_plugins(self.state_dir)
+        self.assertEqual(result, [("telegram", False)])
+
+    def test_plugin_without_toml_is_disabled(self):
+        (self.state_dir / "plugins" / "bare.py").write_text("# plugin")
+        from install import list_plugins
+        result = list_plugins(self.state_dir)
+        self.assertEqual(result, [("bare", False)])
+
+    def test_returns_multiple_plugins_sorted(self):
+        (self.state_dir / "plugins" / "beta.py").write_text("# b")
+        (self.state_dir / "plugins" / "beta.toml").write_text("enabled = true")
+        (self.state_dir / "plugins" / "alpha.py").write_text("# a")
+        (self.state_dir / "plugins" / "alpha.toml").write_text("enabled = false")
+        from install import list_plugins
+        result = list_plugins(self.state_dir)
+        self.assertEqual(result, [("alpha", False), ("beta", True)])
+
+    def test_ignores_init_py(self):
+        (self.state_dir / "plugins" / "__init__.py").write_text("")
+        from install import list_plugins
+        result = list_plugins(self.state_dir)
+        self.assertEqual(result, [])
+
+
+# ── proxy_status ──────────────────────────────────────────────────────────
+
+class TestProxyStatus(unittest.TestCase):
+    def test_returns_none_when_proxy_not_running(self):
+        from install import proxy_status
+        # Use a port that's definitely not running
+        result = proxy_status(port=19999)
+        self.assertIsNone(result)
+
+    def test_returns_dict_on_healthy_proxy(self):
+        from install import proxy_status
+        with patch("install.urllib.request.urlopen") as mock_open:
+            mock_response = MagicMock()
+            mock_response.read.return_value = b'{"status": "ok", "plugins": []}'
+            mock_response.__enter__ = lambda s: s
+            mock_response.__exit__ = MagicMock(return_value=False)
+            mock_open.return_value = mock_response
+            result = proxy_status(port=18019)
+        self.assertEqual(result, {"status": "ok", "plugins": []})
+
+    def test_returns_none_on_connection_error(self):
+        from install import proxy_status
+        with patch("install.urllib.request.urlopen", side_effect=Exception("refused")):
+            result = proxy_status(port=18019)
+        self.assertIsNone(result)
+
+
 if __name__ == "__main__":
     unittest.main()

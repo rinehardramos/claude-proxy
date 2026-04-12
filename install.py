@@ -1,24 +1,17 @@
 """
-claude-proxy installer — global setup for Claude Code integration.
+claude-proxy installer — library functions for setup and plugin management.
 
-Usage:
+Prefer using setup.py for the CLI interface:
+    python3 setup.py install              # full install
+    python3 setup.py uninstall            # full removal
+    python3 setup.py add-plugin <name>    # enable a plugin
+    python3 setup.py remove-plugin <name> # disable a plugin
+    python3 setup.py list-plugins         # show installed plugins
+    python3 setup.py status               # proxy health check
+
+Legacy usage (still works):
     python3 install.py           # install
-    python3 install.py uninstall # full removal: kill proxy, delete runtime dir,
-                                 # remove settings hook, remove shell profile block
-
-What it does (install):
-  1. Creates ~/.claude/claude-proxy/{plugins,sideload/inbound,sideload/outbound}
-  2. Copies plugins/*.py → ~/.claude/claude-proxy/plugins/
-  3. Writes a starter plugins.toml (skips if already present)
-  4. Patches ~/.claude/settings.json — SessionStart hook starts proxy on session open
-  5. Patches shell profile — starts proxy + conditionally exports ANTHROPIC_BASE_URL
-     (only exported when the proxy is confirmed healthy = automatic direct fallback)
-
-What it does (uninstall):
-  1. Sends SIGTERM to running proxy via PID file
-  2. Removes ~/.claude/claude-proxy/ entirely
-  3. Removes SessionStart hook from settings.json
-  4. Removes the claude-proxy block from your shell profile
+    python3 install.py uninstall # full removal
 """
 from __future__ import annotations
 
@@ -28,6 +21,7 @@ import re
 import shutil
 import signal
 import sys
+import urllib.request
 from pathlib import Path
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -225,6 +219,90 @@ def kill_proxy(state_dir: Path) -> None:
         pid_file.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def _set_toml_enabled(text: str, enabled: bool) -> str:
+    """Set or update the `enabled` flag in a TOML string."""
+    val = "true" if enabled else "false"
+    if re.search(r"^enabled\s*=", text, re.MULTILINE):
+        return re.sub(r"^enabled\s*=\s*\S+", f"enabled = {val}", text, count=1, flags=re.MULTILINE)
+    # No enabled line — prepend one
+    return f"enabled = {val}\n{text}"
+
+
+def enable_plugin(state_dir: Path, project_dir: Path, name: str) -> None:
+    """Install and enable a plugin by name.
+
+    Copies .py (always) and .toml (only if missing) from project_dir/plugins/
+    to state_dir/plugins/, then sets ``enabled = true`` in the .toml.
+    """
+    src_py = project_dir / "plugins" / f"{name}.py"
+    if not src_py.exists():
+        raise FileNotFoundError(f"Plugin '{name}' not found at {src_py}")
+
+    dst_plugins = state_dir / "plugins"
+    dst_plugins.mkdir(parents=True, exist_ok=True)
+
+    # Always overwrite .py (code update)
+    (dst_plugins / f"{name}.py").write_bytes(src_py.read_bytes())
+
+    # Copy .toml only if not already present (preserve user config)
+    src_toml = project_dir / "plugins" / f"{name}.toml"
+    dst_toml = dst_plugins / f"{name}.toml"
+    if src_toml.exists() and not dst_toml.exists():
+        dst_toml.write_bytes(src_toml.read_bytes())
+
+    # Ensure .toml exists (create minimal one if no source toml)
+    if not dst_toml.exists():
+        dst_toml.write_text("enabled = true\n", encoding="utf-8")
+    else:
+        text = dst_toml.read_text(encoding="utf-8")
+        dst_toml.write_text(_set_toml_enabled(text, True), encoding="utf-8")
+
+
+def disable_plugin(state_dir: Path, name: str) -> None:
+    """Disable a plugin by setting ``enabled = false`` in its .toml.
+
+    Does NOT delete plugin files — user can re-enable later.
+    """
+    dst_toml = state_dir / "plugins" / f"{name}.toml"
+    if not dst_toml.exists():
+        raise FileNotFoundError(f"Plugin '{name}' config not found at {dst_toml}")
+
+    text = dst_toml.read_text(encoding="utf-8")
+    dst_toml.write_text(_set_toml_enabled(text, False), encoding="utf-8")
+
+
+def list_plugins(state_dir: Path) -> list[tuple[str, bool]]:
+    """Return a sorted list of (name, enabled) for all installed plugins."""
+    plugins_dir = state_dir / "plugins"
+    if not plugins_dir.exists():
+        return []
+
+    result = []
+    for py_file in sorted(plugins_dir.glob("*.py")):
+        if py_file.name.startswith("__"):
+            continue
+        name = py_file.stem
+        toml_file = plugins_dir / f"{name}.toml"
+        enabled = False
+        if toml_file.exists():
+            text = toml_file.read_text(encoding="utf-8")
+            match = re.search(r"^enabled\s*=\s*(\S+)", text, re.MULTILINE)
+            if match:
+                enabled = match.group(1).lower() == "true"
+        result.append((name, enabled))
+    return result
+
+
+def proxy_status(port: int = 18019) -> dict | None:
+    """Query the proxy health endpoint. Returns parsed JSON or None."""
+    try:
+        url = f"http://127.0.0.1:{port}/proxy-status"
+        with urllib.request.urlopen(url, timeout=2) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
 
 
 # ── Install / Uninstall orchestration ─────────────────────────────────────
