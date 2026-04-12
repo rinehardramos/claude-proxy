@@ -94,10 +94,17 @@ def create_runtime_dirs(state_dir: Path) -> None:
 
 
 def install_plugins(src_dir: Path, dst_dir: Path) -> None:
-    """Copy all *.py files from src_dir to dst_dir (overwrites)."""
+    """Copy all *.py and *.toml files from src_dir to dst_dir.
+
+    .py files are always overwritten (code updates).
+    .toml files are only written if missing (preserves user config).
+    """
     for py_file in src_dir.glob("*.py"):
-        dst = dst_dir / py_file.name
-        dst.write_bytes(py_file.read_bytes())
+        (dst_dir / py_file.name).write_bytes(py_file.read_bytes())
+    for toml_file in src_dir.glob("*.toml"):
+        dst = dst_dir / toml_file.name
+        if not dst.exists():
+            dst.write_bytes(toml_file.read_bytes())
 
 
 def write_plugins_toml(path: Path) -> None:

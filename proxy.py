@@ -91,55 +91,262 @@ def _parse_plugins_toml(text: str) -> dict:
     return result
 
 
-# ── Plugin loader ──────────────────────────────────────────────────────────
+# ── Plugin config helpers ──────────────────────────────────────────────────
+
+def load_plugin_config(plugins_dir: Path, name: str) -> dict:
+    """Load <name>.toml from plugins_dir. Returns {} if not found or unreadable."""
+    if not plugins_dir.exists():
+        return {}
+    toml_path = plugins_dir / f"{name}.toml"
+    if not toml_path.exists():
+        return {}
+    try:
+        return _parse_plugins_toml(toml_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def is_plugin_enabled(name: str, local_config: dict, global_config: dict) -> bool:
+    """Check if a plugin is enabled.
+
+    Resolution order:
+      1. local_config "enabled" key (from <name>.toml) — string "true"/"false"
+      2. global_config "enabled" list (from plugins.toml)
+    """
+    if "enabled" in local_config:
+        val = local_config["enabled"]
+        if isinstance(val, str):
+            return val.lower() in ("true", "1", "yes")
+        return bool(val)
+    return name in global_config.get("enabled", [])
+
+
+def validate_plugin(module) -> bool:
+    """Validate a plugin module before activation.
+
+    Requirements:
+      - Must have plugin_info() returning a dict with "name" key.
+      - If health_check() is defined, it must return True.
+    """
+    if not hasattr(module, "plugin_info"):
+        return False
+    try:
+        info = module.plugin_info()
+        if not isinstance(info, dict) or "name" not in info:
+            return False
+    except Exception:
+        return False
+
+    if hasattr(module, "health_check"):
+        try:
+            if not module.health_check():
+                return False
+        except Exception:
+            return False
+
+    return True
+
+
+# ── PluginManager ──────────────────────────────────────────────────────────
+
+class PluginManager:
+    """Manages plugin lifecycle: loading, validation, and zero-downtime hot-reload.
+
+    Plugins are loaded from .py files in the plugins directory. Each plugin's
+    config comes from a sibling .toml file (e.g. telegram.py → telegram.toml),
+    with fallback to the global plugins.toml for backward compatibility.
+
+    Zero-downtime reload:
+      - When no requests are in-flight, swaps happen immediately.
+      - When requests are active, the new plugin list is held pending and
+        applied the moment the last in-flight request completes.
+      - A timeout forces the swap after swap_timeout seconds to prevent
+        indefinite delays from long-running requests.
+    """
+
+    def __init__(
+        self,
+        plugins_dir: Path = PLUGINS_DIR,
+        global_config_path: Path = PLUGINS_TOML,
+        poll_interval: float = 2.0,
+        swap_timeout: float = 5.0,
+    ):
+        self._plugins_dir = plugins_dir
+        self._global_config_path = global_config_path
+        self._poll_interval = poll_interval
+        self._swap_timeout = swap_timeout
+        self._plugins: list = []
+        self._file_state: dict[str, float] = {}  # path → mtime
+        self._in_flight: int = 0
+        self._pending_plugins: list | None = None
+        self._pending_since: float | None = None
+        self._lock = threading.Lock()
+
+    # ── Public API ────────────────────────────────────────────────────────
+
+    @property
+    def plugins(self) -> list:
+        return self._plugins
+
+    @property
+    def has_pending_swap(self) -> bool:
+        return self._pending_plugins is not None
+
+    def enter_request(self) -> None:
+        """Call at the start of each proxied request."""
+        with self._lock:
+            self._in_flight += 1
+
+    def exit_request(self) -> None:
+        """Call at the end of each proxied request (in a finally block)."""
+        with self._lock:
+            self._in_flight -= 1
+            if self._in_flight == 0 and self._pending_plugins is not None:
+                self._apply_swap()
+
+    def initial_load(self) -> None:
+        """Load all enabled plugins. Called once at startup."""
+        self._plugins = self._build_plugin_list()
+        self._snapshot_files()
+
+    def start_watcher(self) -> None:
+        """Start the background file-watcher thread (daemon)."""
+        t = threading.Thread(target=self._watch_loop, daemon=True)
+        t.start()
+
+    def check_and_reload(self) -> None:
+        """Check for file changes and trigger reload. Also enforces swap timeout."""
+        # Check timeout on pending swap regardless of file changes
+        if self._pending_plugins is not None:
+            with self._lock:
+                if (self._pending_since is not None
+                        and time.time() - self._pending_since > self._swap_timeout):
+                    self._apply_swap()
+                    self._snapshot_files()
+                    return
+
+        if not self._has_changes():
+            return
+
+        new_plugins = self._build_plugin_list()
+        with self._lock:
+            if self._in_flight == 0:
+                self._plugins = new_plugins
+                self._pending_plugins = None
+                self._pending_since = None
+            else:
+                self._pending_plugins = new_plugins
+                self._pending_since = time.time()
+        self._snapshot_files()
+
+    # ── Internals ─────────────────────────────────────────────────────────
+
+    def _apply_swap(self) -> None:
+        """Apply pending swap. Must be called under self._lock."""
+        if self._pending_plugins is not None:
+            self._plugins = self._pending_plugins
+            self._pending_plugins = None
+            self._pending_since = None
+            print("[proxy] plugin hot-reload applied", file=sys.stderr, flush=True)
+
+    def _watch_loop(self) -> None:
+        while True:
+            time.sleep(self._poll_interval)
+            try:
+                self.check_and_reload()
+            except Exception as exc:
+                print(f"[proxy] watcher error: {exc}", file=sys.stderr)
+
+    def _has_changes(self) -> bool:
+        return self._get_file_state() != self._file_state
+
+    def _snapshot_files(self) -> None:
+        self._file_state = self._get_file_state()
+
+    def _get_file_state(self) -> dict[str, float]:
+        state: dict[str, float] = {}
+        if not self._plugins_dir.exists():
+            return state
+        for f in self._plugins_dir.iterdir():
+            if f.suffix in (".py", ".toml"):
+                try:
+                    state[str(f)] = f.stat().st_mtime
+                except OSError:
+                    pass
+        # Also track global config
+        if self._global_config_path.exists():
+            try:
+                state[str(self._global_config_path)] = self._global_config_path.stat().st_mtime
+            except OSError:
+                pass
+        return state
+
+    def _load_global_config(self) -> dict:
+        if not self._global_config_path.exists():
+            return {}
+        try:
+            return _parse_plugins_toml(
+                self._global_config_path.read_text(encoding="utf-8")
+            )
+        except Exception:
+            return {}
+
+    def _build_plugin_list(self) -> list:
+        """Load all enabled, valid, healthy plugins."""
+        plugins: list = []
+        global_config = self._load_global_config()
+
+        if not self._plugins_dir.exists():
+            return plugins
+
+        for py_file in sorted(self._plugins_dir.glob("*.py")):
+            name = py_file.stem
+            local_config = load_plugin_config(self._plugins_dir, name)
+
+            if not is_plugin_enabled(name, local_config, global_config):
+                continue
+
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    f"_proxy_plugin_{name}", py_file
+                )
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+                if not validate_plugin(mod):
+                    print(f"[proxy] plugin '{name}' failed validation", file=sys.stderr)
+                    continue
+
+                # Merge config: global [name] section + local .toml (local wins).
+                # Strip "enabled" — it's metadata, not plugin config.
+                global_section = global_config.get(name, {})
+                merged = {}
+                if isinstance(global_section, dict):
+                    merged.update(global_section)
+                merged.update({k: v for k, v in local_config.items() if k != "enabled"})
+
+                if hasattr(mod, "configure"):
+                    mod.configure(merged)
+
+                plugins.append(mod)
+                label = mod.plugin_info()["name"]
+                print(f"[proxy] loaded plugin: {label}", file=sys.stderr, flush=True)
+            except Exception as exc:
+                print(f"[proxy] failed to load plugin '{name}': {exc}", file=sys.stderr)
+
+        return plugins
+
+
+# ── Legacy wrapper ─────────────────────────────────────────────────────────
 
 def load_plugins(
     plugins_dir: Path = PLUGINS_DIR,
     config_file: Path = PLUGINS_TOML,
 ) -> list:
-    """Discover, import, and configure enabled plugins.
-
-    Only plugins listed in plugins.toml's `enabled` array are loaded.
-    Each plugin's config section is passed to configure() if defined.
-    Import errors are caught and logged — they never crash the proxy.
-    """
-    plugins: list = []
-    enabled: list[str] = []
-    plugin_configs: dict[str, dict] = {}
-
-    if config_file.exists():
-        try:
-            text = config_file.read_text(encoding="utf-8")
-            config = _parse_plugins_toml(text)
-            enabled = config.get("enabled", [])
-            plugin_configs = {k: v for k, v in config.items() if isinstance(v, dict)}
-        except Exception as exc:
-            print(f"[proxy] Failed to read {config_file}: {exc}", file=sys.stderr)
-
-    if not plugins_dir.exists():
-        return plugins
-
-    for py_file in sorted(plugins_dir.glob("*.py")):
-        plugin_name = py_file.stem
-        if plugin_name not in enabled:
-            continue
-        try:
-            spec = importlib.util.spec_from_file_location(
-                f"_proxy_plugin_{plugin_name}", py_file
-            )
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)  # type: ignore[union-attr]
-
-            if hasattr(mod, "configure"):
-                mod.configure(plugin_configs.get(plugin_name, {}))
-
-            plugins.append(mod)
-            label = mod.plugin_info()["name"] if hasattr(mod, "plugin_info") else plugin_name
-            print(f"[proxy] loaded plugin: {label}", file=sys.stderr, flush=True)
-        except Exception as exc:
-            print(f"[proxy] Failed to load plugin '{plugin_name}': {exc}", file=sys.stderr)
-
-    return plugins
+    """Load plugins once (legacy wrapper around PluginManager.initial_load)."""
+    mgr = PluginManager(plugins_dir, config_file)
+    mgr.initial_load()
+    return mgr.plugins
 
 
 # ── Sideload ───────────────────────────────────────────────────────────────
@@ -361,7 +568,13 @@ class ThreadedHTTPServer(http.server.HTTPServer):
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    plugins: list = []  # set by main() after load_plugins()
+    plugin_manager: PluginManager | None = None  # set by main()
+    plugins: list = []  # backward compat for tests without PluginManager
+
+    def _get_plugins(self) -> list:
+        if self.plugin_manager:
+            return self.plugin_manager.plugins
+        return self.plugins
 
     # ── routing ───────────────────────────────────────────────────────────
 
@@ -378,7 +591,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def _health(self):
         plugin_names: list[str] = []
-        for p in self.plugins:
+        for p in self._get_plugins():
             if hasattr(p, "plugin_info"):
                 try:
                     plugin_names.append(p.plugin_info()["name"])
@@ -407,6 +620,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def _forward(self, method: str):
         global _last_activity
         _last_activity = time.time()
+
+        if self.plugin_manager:
+            self.plugin_manager.enter_request()
+        try:
+            self._forward_inner(method)
+        finally:
+            if self.plugin_manager:
+                self.plugin_manager.exit_request()
+
+    def _forward_inner(self, method: str):
+        plugins = self._get_plugins()
 
         length = int(self.headers.get("Content-Length", 0))
         raw_body = self.rfile.read(length) if length else b""
@@ -438,7 +662,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             payload = inject_outbound(payload, outbound_items)
 
             # Call on_outbound plugins
-            for plugin in self.plugins:
+            for plugin in plugins:
                 if not hasattr(plugin, "on_outbound"):
                     continue
                 try:
@@ -491,7 +715,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 process_sse_stream(
                     resp_lines=iter(resp.readline, b""),
                     write_fn=write_chunk,
-                    plugins=self.plugins,
+                    plugins=plugins,
                     request_summary=request_summary,
                     inbound_sideload=inbound_sideload,
                 )
@@ -504,9 +728,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             resp_body = resp.read()
 
             # Non-streaming: inject into JSON content array if needed
-            if inbound_sideload or any(hasattr(p, "on_inbound") for p in self.plugins):
+            if inbound_sideload or any(hasattr(p, "on_inbound") for p in plugins):
                 resp_body = _inject_non_streaming(
-                    resp_body, self.plugins, request_summary, inbound_sideload
+                    resp_body, plugins, request_summary, inbound_sideload
                 )
 
             self.send_header("Content-Length", str(len(resp_body)))
@@ -660,8 +884,10 @@ def main():
         log_fd = os.open(str(LOG_FILE), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         os.dup2(log_fd, 2)
 
-    plugins = load_plugins()
-    ProxyHandler.plugins = plugins
+    plugin_mgr = PluginManager()
+    plugin_mgr.initial_load()
+    plugin_mgr.start_watcher()
+    ProxyHandler.plugin_manager = plugin_mgr
 
     server = ThreadedHTTPServer(("127.0.0.1", port), ProxyHandler)
     _write_pid(os.getpid())

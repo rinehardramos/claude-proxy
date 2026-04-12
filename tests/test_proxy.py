@@ -16,6 +16,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import proxy as _proxy_mod
 from proxy import (
     _parse_plugins_toml,
+    load_plugin_config,
+    is_plugin_enabled,
+    validate_plugin,
+    PluginManager,
     load_plugins,
     load_sideload,
     inject_outbound,
@@ -501,6 +505,324 @@ class TestHealthEndpoint(unittest.TestCase):
         h = self._make_handler()
         h._health()
         h.send_response.assert_called_once_with(200)
+
+
+# ── load_plugin_config ─────────────────────────────────────────────────────
+
+class TestLoadPluginConfig(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_returns_config_when_toml_exists(self):
+        (self.d / "myplugin.toml").write_text('enabled = true\nkey = "val"')
+        cfg = load_plugin_config(self.d, "myplugin")
+        self.assertEqual(cfg["key"], "val")
+
+    def test_returns_empty_when_toml_missing(self):
+        self.assertEqual(load_plugin_config(self.d, "nope"), {})
+
+    def test_parses_enabled_true(self):
+        (self.d / "p.toml").write_text("enabled = true")
+        cfg = load_plugin_config(self.d, "p")
+        self.assertIn("enabled", cfg)
+
+    def test_handles_malformed_toml(self):
+        (self.d / "bad.toml").write_text("this is not valid @@@ toml")
+        cfg = load_plugin_config(self.d, "bad")
+        self.assertIsInstance(cfg, dict)
+
+    def test_returns_empty_when_dir_missing(self):
+        self.assertEqual(load_plugin_config(self.d / "nope", "x"), {})
+
+
+# ── is_plugin_enabled ──────────────────────────────────────────────────────
+
+class TestIsPluginEnabled(unittest.TestCase):
+    def test_enabled_true_in_local_config(self):
+        self.assertTrue(is_plugin_enabled("p", {"enabled": "true"}, {}))
+
+    def test_enabled_false_in_local_config(self):
+        self.assertFalse(is_plugin_enabled("p", {"enabled": "false"}, {}))
+
+    def test_no_local_config_uses_global_enabled(self):
+        self.assertTrue(is_plugin_enabled("p", {}, {"enabled": ["p"]}))
+
+    def test_no_local_config_not_in_global(self):
+        self.assertFalse(is_plugin_enabled("p", {}, {"enabled": ["other"]}))
+
+    def test_local_config_overrides_global(self):
+        self.assertFalse(is_plugin_enabled("p", {"enabled": "false"}, {"enabled": ["p"]}))
+
+    def test_empty_everything_is_disabled(self):
+        self.assertFalse(is_plugin_enabled("p", {}, {}))
+
+
+# ── validate_plugin ────────────────────────────────────────────────────────
+
+class TestValidatePlugin(unittest.TestCase):
+    def _make_module(self, **attrs):
+        mod = type(sys)("fake_plugin")
+        for k, v in attrs.items():
+            setattr(mod, k, v)
+        return mod
+
+    def test_valid_with_plugin_info(self):
+        mod = self._make_module(plugin_info=lambda: {"name": "t", "version": "1"})
+        self.assertTrue(validate_plugin(mod))
+
+    def test_invalid_without_plugin_info(self):
+        mod = self._make_module()
+        self.assertFalse(validate_plugin(mod))
+
+    def test_plugin_info_must_return_dict_with_name(self):
+        mod = self._make_module(plugin_info=lambda: {"version": "1"})
+        self.assertFalse(validate_plugin(mod))
+
+    def test_health_check_true_passes(self):
+        mod = self._make_module(
+            plugin_info=lambda: {"name": "t"},
+            health_check=lambda: True,
+        )
+        self.assertTrue(validate_plugin(mod))
+
+    def test_health_check_false_fails(self):
+        mod = self._make_module(
+            plugin_info=lambda: {"name": "t"},
+            health_check=lambda: False,
+        )
+        self.assertFalse(validate_plugin(mod))
+
+    def test_health_check_exception_fails(self):
+        def _boom():
+            raise RuntimeError("boom")
+        mod = self._make_module(plugin_info=lambda: {"name": "t"}, health_check=_boom)
+        self.assertFalse(validate_plugin(mod))
+
+    def test_no_health_check_passes(self):
+        mod = self._make_module(plugin_info=lambda: {"name": "t"})
+        self.assertTrue(validate_plugin(mod))
+
+
+# ── PluginManager ──────────────────────────────────────────────────────────
+
+class TestPluginManager(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.plugins_dir = Path(self.tmp.name) / "plugins"
+        self.plugins_dir.mkdir()
+        self.config_file = Path(self.tmp.name) / "plugins.toml"
+        self.config_file.write_text('enabled = []')
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write_plugin(self, name, code):
+        (self.plugins_dir / f"{name}.py").write_text(textwrap.dedent(code))
+
+    def _write_plugin_config(self, name, text):
+        (self.plugins_dir / f"{name}.toml").write_text(text)
+
+    def _mgr(self, **kw):
+        m = PluginManager(self.plugins_dir, self.config_file, poll_interval=0.1, **kw)
+        m.initial_load()
+        return m
+
+    def test_initial_load_picks_up_enabled_plugins(self):
+        self._write_plugin("a", '''\
+            def plugin_info():
+                return {"name": "a", "version": "1"}
+        ''')
+        self._write_plugin_config("a", "enabled = true")
+        m = self._mgr()
+        self.assertEqual(len(m.plugins), 1)
+        self.assertEqual(m.plugins[0].plugin_info()["name"], "a")
+
+    def test_initial_load_skips_disabled(self):
+        self._write_plugin("a", '''\
+            def plugin_info():
+                return {"name": "a", "version": "1"}
+        ''')
+        self._write_plugin_config("a", "enabled = false")
+        m = self._mgr()
+        self.assertEqual(len(m.plugins), 0)
+
+    def test_detects_new_plugin_file(self):
+        m = self._mgr()
+        self.assertEqual(len(m.plugins), 0)
+        self._write_plugin("b", '''\
+            def plugin_info():
+                return {"name": "b", "version": "1"}
+        ''')
+        self._write_plugin_config("b", "enabled = true")
+        m.check_and_reload()
+        self.assertEqual(len(m.plugins), 1)
+
+    def test_detects_config_change(self):
+        self._write_plugin("c", '''\
+            def plugin_info():
+                return {"name": "c", "version": "1"}
+        ''')
+        self._write_plugin_config("c", "enabled = false")
+        m = self._mgr()
+        self.assertEqual(len(m.plugins), 0)
+        # Enable it
+        time.sleep(0.05)  # ensure mtime differs
+        self._write_plugin_config("c", "enabled = true")
+        m.check_and_reload()
+        self.assertEqual(len(m.plugins), 1)
+
+    def test_skips_plugin_that_fails_health_check(self):
+        self._write_plugin("sick", '''\
+            def plugin_info():
+                return {"name": "sick", "version": "1"}
+            def health_check():
+                return False
+        ''')
+        self._write_plugin_config("sick", "enabled = true")
+        m = self._mgr()
+        self.assertEqual(len(m.plugins), 0)
+
+    def test_passes_local_config_to_configure(self):
+        self._write_plugin("cfg", '''\
+            received = {}
+            def plugin_info():
+                return {"name": "cfg", "version": "1"}
+            def configure(config):
+                received.update(config)
+        ''')
+        self._write_plugin_config("cfg", 'enabled = true\nmy_key = "my_val"')
+        m = self._mgr()
+        self.assertEqual(m.plugins[0].received, {"my_key": "my_val"})
+
+    def test_local_config_does_not_pass_enabled_to_configure(self):
+        self._write_plugin("cfg2", '''\
+            received = {}
+            def plugin_info():
+                return {"name": "cfg2", "version": "1"}
+            def configure(config):
+                received.update(config)
+        ''')
+        self._write_plugin_config("cfg2", 'enabled = true\nfoo = "bar"')
+        m = self._mgr()
+        self.assertNotIn("enabled", m.plugins[0].received)
+
+    def test_swap_immediate_when_idle(self):
+        m = self._mgr()
+        self._write_plugin("d", '''\
+            def plugin_info():
+                return {"name": "d", "version": "1"}
+        ''')
+        self._write_plugin_config("d", "enabled = true")
+        m.check_and_reload()
+        self.assertEqual(len(m.plugins), 1)
+
+    def test_swap_deferred_when_busy(self):
+        self._write_plugin("e", '''\
+            def plugin_info():
+                return {"name": "e", "version": "1"}
+        ''')
+        self._write_plugin_config("e", "enabled = true")
+        m = self._mgr()
+        self.assertEqual(len(m.plugins), 1)
+
+        # Simulate in-flight request
+        m.enter_request()
+
+        # Modify plugin to verify reload happens
+        self._write_plugin("f", '''\
+            def plugin_info():
+                return {"name": "f", "version": "1"}
+        ''')
+        self._write_plugin_config("f", "enabled = true")
+        time.sleep(0.05)
+        m.check_and_reload()
+
+        # Should still have old plugins (pending swap)
+        names = [p.plugin_info()["name"] for p in m.plugins]
+        self.assertNotIn("f", names)
+        self.assertTrue(m.has_pending_swap)
+
+    def test_pending_swap_applied_on_exit_request(self):
+        self._write_plugin("g", '''\
+            def plugin_info():
+                return {"name": "g", "version": "1"}
+        ''')
+        self._write_plugin_config("g", "enabled = true")
+        m = self._mgr()
+        m.enter_request()
+
+        self._write_plugin("h", '''\
+            def plugin_info():
+                return {"name": "h", "version": "1"}
+        ''')
+        self._write_plugin_config("h", "enabled = true")
+        time.sleep(0.05)
+        m.check_and_reload()
+
+        # Complete the in-flight request
+        m.exit_request()
+
+        names = [p.plugin_info()["name"] for p in m.plugins]
+        self.assertIn("h", names)
+
+    def test_forced_swap_after_timeout(self):
+        self._write_plugin("i", '''\
+            def plugin_info():
+                return {"name": "i", "version": "1"}
+        ''')
+        self._write_plugin_config("i", "enabled = true")
+        m = self._mgr(swap_timeout=0.1)
+        m.enter_request()
+
+        self._write_plugin("j", '''\
+            def plugin_info():
+                return {"name": "j", "version": "1"}
+        ''')
+        self._write_plugin_config("j", "enabled = true")
+        time.sleep(0.05)
+        m.check_and_reload()
+        self.assertTrue(m.has_pending_swap)
+
+        # Wait for timeout
+        time.sleep(0.15)
+        m.check_and_reload()
+
+        names = [p.plugin_info()["name"] for p in m.plugins]
+        self.assertIn("j", names)
+        self.assertFalse(m.has_pending_swap)
+
+    def test_backward_compat_global_enabled_list(self):
+        """Plugins enabled via plugins.toml enabled=[] still work."""
+        self._write_plugin("legacy", '''\
+            def plugin_info():
+                return {"name": "legacy", "version": "1"}
+        ''')
+        self.config_file.write_text('enabled = ["legacy"]')
+        m = self._mgr()
+        self.assertEqual(len(m.plugins), 1)
+        self.assertEqual(m.plugins[0].plugin_info()["name"], "legacy")
+
+    def test_global_section_merged_with_local_config(self):
+        """Global plugins.toml [name] section merges with local .toml, local wins."""
+        self._write_plugin("merge", '''\
+            received = {}
+            def plugin_info():
+                return {"name": "merge", "version": "1"}
+            def configure(config):
+                received.update(config)
+        ''')
+        self.config_file.write_text(
+            'enabled = []\n[merge]\nglobal_key = "from_global"\nshared = "global_val"'
+        )
+        self._write_plugin_config("merge", 'enabled = true\nshared = "local_val"\nlocal_key = "from_local"')
+        m = self._mgr()
+        self.assertEqual(m.plugins[0].received["global_key"], "from_global")
+        self.assertEqual(m.plugins[0].received["shared"], "local_val")
+        self.assertEqual(m.plugins[0].received["local_key"], "from_local")
 
 
 # ── main() dedup guard ─────────────────────────────────────────────────────

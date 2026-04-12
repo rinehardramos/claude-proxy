@@ -117,6 +117,17 @@ class TestInstallPlugins(unittest.TestCase):
         install_plugins(self.src_dir, self.dst_dir)
         self.assertEqual((self.dst_dir / "telegram.py").read_text(), "new content")
 
+    def test_copies_toml_files(self):
+        (self.src_dir / "telegram.toml").write_text("enabled = false")
+        install_plugins(self.src_dir, self.dst_dir)
+        self.assertTrue((self.dst_dir / "telegram.toml").exists())
+
+    def test_does_not_overwrite_existing_toml(self):
+        (self.src_dir / "telegram.toml").write_text("new defaults")
+        (self.dst_dir / "telegram.toml").write_text("user config")
+        install_plugins(self.src_dir, self.dst_dir)
+        self.assertEqual((self.dst_dir / "telegram.toml").read_text(), "user config")
+
 
 # ── write_plugins_toml ─────────────────────────────────────────────────────
 
