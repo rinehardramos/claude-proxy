@@ -510,6 +510,60 @@ class TestUninstallFull(unittest.TestCase):
         self._uninstall()  # should not raise
 
 
+# ── install_launchagent / uninstall_launchagent ───────────────────────────
+
+class TestLaunchAgent(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.plist = Path(self.tmp) / "com.claude-proxy.env.plist"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_install_creates_plist(self):
+        from setup import install_launchagent
+        with patch("setup._LAUNCHAGENT_PATH", self.plist), \
+             patch("setup.subprocess.run"), \
+             patch("setup.sys.platform", "darwin"):
+            install_launchagent()
+        self.assertTrue(self.plist.exists())
+        self.assertIn("127.0.0.1:18019", self.plist.read_text())
+
+    def test_install_idempotent(self):
+        from setup import install_launchagent
+        self.plist.write_text("existing")
+        with patch("setup._LAUNCHAGENT_PATH", self.plist), \
+             patch("setup.subprocess.run") as mock_run, \
+             patch("setup.sys.platform", "darwin"):
+            install_launchagent()
+        mock_run.assert_not_called()
+        self.assertEqual(self.plist.read_text(), "existing")
+
+    def test_install_noop_on_non_darwin(self):
+        from setup import install_launchagent
+        with patch("setup._LAUNCHAGENT_PATH", self.plist), \
+             patch("setup.sys.platform", "linux"):
+            install_launchagent()
+        self.assertFalse(self.plist.exists())
+
+    def test_uninstall_removes_plist(self):
+        from setup import uninstall_launchagent
+        self.plist.write_text("content")
+        with patch("setup._LAUNCHAGENT_PATH", self.plist), \
+             patch("setup.subprocess.run"), \
+             patch("setup.sys.platform", "darwin"):
+            uninstall_launchagent()
+        self.assertFalse(self.plist.exists())
+
+    def test_uninstall_noop_when_missing(self):
+        from setup import uninstall_launchagent
+        with patch("setup._LAUNCHAGENT_PATH", self.plist), \
+             patch("setup.subprocess.run") as mock_run, \
+             patch("setup.sys.platform", "darwin"):
+            uninstall_launchagent()
+        mock_run.assert_not_called()
+
+
 # ── enable_plugin ─────────────────────────────────────────────────────────
 
 class TestEnablePlugin(unittest.TestCase):

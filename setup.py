@@ -236,6 +236,76 @@ def kill_proxy(state_dir: Path) -> None:
         pass
 
 
+_LAUNCHAGENT_LABEL = "com.claude-proxy.env"
+_LAUNCHAGENT_PATH = Path.home() / "Library" / "LaunchAgents" / f"{_LAUNCHAGENT_LABEL}.plist"
+_LAUNCHAGENT_PLIST = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/launchctl</string>
+        <string>setenv</string>
+        <string>ANTHROPIC_BASE_URL</string>
+        <string>http://127.0.0.1:18019</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+"""
+
+
+def install_launchagent() -> None:
+    """Install a LaunchAgent that sets ANTHROPIC_BASE_URL system-wide at login.
+
+    This ensures GUI apps (Claude Code) always route through the proxy,
+    even when they don't inherit shell environment variables.
+    Idempotent -- does nothing if already installed.
+    """
+    if sys.platform != "darwin":
+        return
+    if _LAUNCHAGENT_PATH.exists():
+        return
+    _LAUNCHAGENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _LAUNCHAGENT_PATH.write_text(
+        _LAUNCHAGENT_PLIST.format(label=_LAUNCHAGENT_LABEL), encoding="utf-8"
+    )
+    try:
+        subprocess.run(
+            ["launchctl", "load", str(_LAUNCHAGENT_PATH)],
+            check=False, capture_output=True,
+        )
+        subprocess.run(
+            ["launchctl", "setenv", "ANTHROPIC_BASE_URL", "http://127.0.0.1:18019"],
+            check=False, capture_output=True,
+        )
+    except FileNotFoundError:
+        pass  # launchctl not available
+
+
+def uninstall_launchagent() -> None:
+    """Remove the claude-proxy LaunchAgent -- idempotent."""
+    if sys.platform != "darwin":
+        return
+    if not _LAUNCHAGENT_PATH.exists():
+        return
+    try:
+        subprocess.run(
+            ["launchctl", "unload", str(_LAUNCHAGENT_PATH)],
+            check=False, capture_output=True,
+        )
+    except FileNotFoundError:
+        pass
+    try:
+        _LAUNCHAGENT_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _set_toml_enabled(text: str, enabled: bool) -> str:
     """Set or update the ``enabled`` flag in a TOML string."""
     val = "true" if enabled else "false"
@@ -351,6 +421,9 @@ def install(
     print(f"[claude-proxy] Patching {shell_profile}...")
     patch_shell_profile(shell_profile, proxy_py)
 
+    print("[claude-proxy] Installing LaunchAgent (ANTHROPIC_BASE_URL for GUI apps)...")
+    install_launchagent()
+
     print("""
 [claude-proxy] Installation complete.
 
@@ -387,6 +460,9 @@ def uninstall(
 
     print(f"[claude-proxy] Removing shell profile block from {shell_profile}...")
     unpatch_shell_profile(shell_profile)
+
+    print("[claude-proxy] Removing LaunchAgent...")
+    uninstall_launchagent()
 
     print(f"\n[claude-proxy] Uninstalled. Reload your shell:  source {shell_profile}")
 
