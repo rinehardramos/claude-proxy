@@ -42,6 +42,8 @@ def _redact_token(raw: str, rule_id: str) -> str:
 def _discover_scanner() -> str | None:
     """Return path to newest scanner.py in the leak-guard plugin cache, or None."""
     cache = Path("~/.claude/plugins/cache/leak-guard").expanduser()
+    if not cache.exists():
+        return None
     candidates = sorted(
         cache.glob("*/hooks/scanner.py"),
         key=lambda p: p.stat().st_mtime,
