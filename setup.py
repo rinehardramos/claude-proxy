@@ -32,7 +32,9 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -415,8 +417,10 @@ def cmd_add_plugin(args: argparse.Namespace) -> None:
     project_dir = _default_project_dir()
     try:
         enable_plugin(state_dir, project_dir, args.name)
+        toml_path = state_dir / "plugins" / (args.name + ".toml")
         print(f"[claude-proxy] Plugin '{args.name}' enabled.")
-        print(f"  Config: {state_dir / 'plugins' / (args.name + '.toml')}")
+        print(f"  Config: {toml_path}")
+        print(f"  Edit {toml_path} to configure credentials/settings.")
         print("  The proxy will hot-reload the plugin automatically.")
     except FileNotFoundError as e:
         print(f"[claude-proxy] Error: {e}", file=sys.stderr)
@@ -450,6 +454,35 @@ def cmd_list_plugins(args: argparse.Namespace) -> None:
         print(f"  {marker} {name:20s} [{status}]")
 
 
+def cmd_restart(args: argparse.Namespace) -> None:
+    """Kill running proxy and start a fresh one."""
+    state_dir = _default_state_dir()
+    project_dir = _default_project_dir()
+    proxy_py = project_dir / "proxy.py"
+
+    print("[claude-proxy] Stopping proxy...")
+    kill_proxy(state_dir)
+    time.sleep(0.5)
+    subprocess.Popen(
+        [sys.executable, str(proxy_py), "--daemon"],
+        stdout=subprocess.DEVNULL,
+        stderr=open(state_dir / "proxy.log", "a"),
+    )
+    # Wait for health check
+    for _ in range(10):
+        time.sleep(0.3)
+        if proxy_status() is not None:
+            break
+    result = proxy_status()
+    if result:
+        print("[claude-proxy] Proxy restarted successfully.")
+        plugins = result.get("plugins", [])
+        print(f"  Plugins: {', '.join(plugins) if plugins else 'none'}")
+    else:
+        print("[claude-proxy] Proxy failed to start. Check ~/.claude/claude-proxy/proxy.log")
+        sys.exit(1)
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     """Show proxy health status."""
     result = proxy_status()
@@ -481,6 +514,7 @@ def build_parser() -> argparse.ArgumentParser:
     rm_p.add_argument("name", help="Plugin name (e.g. telegram)")
 
     sub.add_parser("list-plugins", help="Show installed plugins and status")
+    sub.add_parser("restart", help="Kill and restart the proxy")
     sub.add_parser("status", help="Show proxy health status")
 
     return parser
@@ -492,6 +526,7 @@ _COMMANDS = {
     "add-plugin": cmd_add_plugin,
     "remove-plugin": cmd_remove_plugin,
     "list-plugins": cmd_list_plugins,
+    "restart": cmd_restart,
     "status": cmd_status,
 }
 

@@ -774,7 +774,7 @@ class TestBuildParser(unittest.TestCase):
 class TestCommandDispatch(unittest.TestCase):
     def test_all_commands_mapped(self):
         expected = {"install", "uninstall", "add-plugin", "remove-plugin",
-                    "list-plugins", "status"}
+                    "list-plugins", "restart", "status"}
         self.assertEqual(set(_COMMANDS.keys()), expected)
 
     def test_no_command_prints_help_and_exits(self):
