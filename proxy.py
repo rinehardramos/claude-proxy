@@ -674,13 +674,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
             body = json.dumps(payload).encode()
 
-        # Build upstream headers (strip hop-by-hop)
-        skip = {"host", "transfer-encoding", "content-length"}
+        # Build upstream headers (strip hop-by-hop + force no compression)
+        skip = {"host", "transfer-encoding", "content-length", "accept-encoding"}
         upstream_headers: dict[str, str] = {
             k: v for k, v in self.headers.items() if k.lower() not in skip
         }
         upstream_headers["Host"] = UPSTREAM_HOST
         upstream_headers["Content-Length"] = str(len(body))
+        upstream_headers["Accept-Encoding"] = "identity"
 
         is_stream = bool(payload.get("stream", False)) if payload else False
 
