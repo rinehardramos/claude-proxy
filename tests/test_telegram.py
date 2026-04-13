@@ -188,6 +188,82 @@ class TestConfigure(unittest.TestCase):
         self.assertEqual(self.t._tts_openai_api_key, "sk-custom")
 
 
+# ── Dynamic Timeout ──────────────────────────────────────────────────────
+
+class TestEstimateTimeout(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+
+    def test_short_text_returns_minimum(self):
+        result = self.t._estimate_timeout(500)
+        self.assertEqual(result, 60)  # min is 60
+
+    def test_scales_with_text_length(self):
+        result = self.t._estimate_timeout(12000)  # 12K chars
+        # base=30 + 15*12 = 210
+        self.assertEqual(result, 210)
+
+    def test_very_long_text(self):
+        result = self.t._estimate_timeout(50000)  # 50K chars
+        # base=30 + 15*50 = 780
+        self.assertEqual(result, 780)
+
+    def test_zero_length(self):
+        result = self.t._estimate_timeout(0)
+        self.assertEqual(result, 60)
+
+
+# ── TTS Status Tracking ─────────────────────────────────────────────────
+
+class TestTTSStatus(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+
+    def test_tts_status_returns_none_when_idle(self):
+        self.t._clear_status()
+        self.assertIsNone(self.t.tts_status())
+
+    def test_update_status_sets_fields(self):
+        self.t._tts_status = {"start_mono": __import__("time").monotonic()}
+        self.t._update_status("abc123", "encoding", engine="say")
+        status = self.t.tts_status()
+        self.assertEqual(status["uid"], "abc123")
+        self.assertEqual(status["stage"], "encoding")
+        self.assertEqual(status["engine"], "say")
+        self.assertIn("elapsed", status)
+
+    def test_clear_status_resets(self):
+        self.t._tts_status = {"uid": "x", "stage": "done"}
+        self.t._clear_status()
+        self.assertIsNone(self.t.tts_status())
+
+    def test_tts_status_returns_copy(self):
+        self.t._tts_status = {"uid": "x", "stage": "encoding", "start_mono": 0}
+        status = self.t.tts_status()
+        status["stage"] = "tampered"
+        self.assertEqual(self.t._tts_status["stage"], "encoding")
+
+    def test_status_tracks_through_tts_to_ogg(self):
+        """_tts_to_ogg sets status stages as it runs."""
+        self.t._TTS_REGISTRY.clear()
+        self.t._register_tts("mock", lambda: None, lambda t, d, u: "/tmp/mock.ogg")
+        ogg, _ = self.t._tts_to_ogg("hello", "mock")
+        self.assertEqual(ogg, "/tmp/mock.ogg")
+        # Status should have been set during the run
+        status = self.t.tts_status()
+        self.assertIsNotNone(status)
+        self.assertIn("uid", status)
+
+    def test_status_shows_failed_on_all_engines_fail(self):
+        self.t._TTS_REGISTRY.clear()
+        self.t._register_tts("bad", lambda: "broken", lambda t, d, u: None)
+        ogg, diags = self.t._tts_to_ogg("hello", "bad")
+        self.assertIsNone(ogg)
+        # Status was set during the check phase
+        status = self.t.tts_status()
+        self.assertIsNotNone(status)
+
+
 # ── TTS Registry ─────────────────────────────────────────────────────────
 
 class TestTTSRegistry(unittest.TestCase):
@@ -568,6 +644,16 @@ class TestGenerateSay(unittest.TestCase):
         with patch("subprocess.run", side_effect=FileNotFoundError("say not found")):
             result = self.t._generate_say("hello", "/tmp", "abc")
         self.assertIsNone(result)
+
+    def test_say_uses_dynamic_timeout(self):
+        """say subprocess timeout scales with text length."""
+        long_text = "x" * 20000  # 20K chars → base=30 + 15*20 = 330s
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            self.t._generate_say(long_text, "/tmp", "dyn")
+        # First call is say, check its timeout
+        say_call = mock_run.call_args_list[0]
+        self.assertEqual(say_call.kwargs["timeout"], 330)
 
 
 class TestGenerateOpenAI(unittest.TestCase):

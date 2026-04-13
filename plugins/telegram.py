@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.request
 import uuid
 
@@ -24,9 +25,44 @@ _tts_engine: str = "say"
 _tts_openai_model: str = "tts-1"
 _tts_openai_voice: str = "alloy"
 _tts_openai_api_key: str | None = None
+_voice_upload_timeout: int = 300
 
 MAX_TG_LENGTH = 4096
 MAX_TG_CAPTION = 1024
+
+
+# ── TTS Status Tracking ──────────────────────────────────────────────────
+
+_tts_status: dict = {}
+
+
+def tts_status() -> dict | None:
+    """Return current TTS task status or None if idle."""
+    return _tts_status.copy() if _tts_status else None
+
+
+def _update_status(uid: str, stage: str, **kwargs) -> None:
+    """Thread-safe status update (GIL protects single dict assignment)."""
+    global _tts_status
+    elapsed = time.monotonic() - _tts_status.get("start_mono", time.monotonic())
+    _tts_status = {
+        "uid": uid,
+        "stage": stage,
+        "elapsed": round(elapsed, 1),
+        **kwargs,
+    }
+
+
+def _clear_status() -> None:
+    global _tts_status
+    _tts_status = {}
+
+
+# ── Dynamic Timeout ──────────────────────────────────────────────────────
+
+def _estimate_timeout(text_len: int, base: int = 30, per_1k_chars: int = 15) -> int:
+    """Estimate subprocess timeout from text length. Min 60s."""
+    return max(60, base + per_1k_chars * (text_len // 1000))
 
 
 # ── TTS Engine Registry ──────────────────────────────────────────────────
@@ -58,11 +94,18 @@ def _check_say() -> str | None:
 def _generate_say(text: str, tmp_dir: str, uid: str) -> str | None:
     aiff_path = os.path.join(tmp_dir, f"tg_{uid}.aiff")
     ogg_path = os.path.join(tmp_dir, f"tg_{uid}.ogg")
+    timeout = _estimate_timeout(len(text))
     try:
+        _update_status(uid, "encoding", engine="say", est_timeout=timeout)
+        _log(f"TTS [{uid}] encoding with say (est. timeout: {timeout}s)")
+        t0 = time.monotonic()
         subprocess.run(
             ["say", "-o", aiff_path, text],
-            check=True, timeout=120, capture_output=True,
+            check=True, timeout=timeout, capture_output=True,
         )
+        enc_elapsed = time.monotonic() - t0
+        _update_status(uid, "converting", engine="say")
+        _log(f"TTS [{uid}] encoding complete ({enc_elapsed:.1f}s), converting to OGG...")
         subprocess.run(
             ["ffmpeg", "-y", "-i", aiff_path, "-c:a", "libopus", "-b:a", "64000", ogg_path],
             check=True, timeout=120, capture_output=True,
@@ -70,7 +113,7 @@ def _generate_say(text: str, tmp_dir: str, uid: str) -> str | None:
         _cleanup(aiff_path)
         return ogg_path
     except Exception as exc:
-        print(f"[telegram] say TTS failed: {exc}", file=sys.stderr)
+        _log(f"TTS [{uid}] say failed: {exc}")
         _cleanup(aiff_path)
         _cleanup(ogg_path)
         return None
@@ -85,7 +128,10 @@ def _check_openai() -> str | None:
 def _generate_openai(text: str, tmp_dir: str, uid: str) -> str | None:
     """OpenAI TTS API → OGG Opus (no ffmpeg needed)."""
     ogg_path = os.path.join(tmp_dir, f"tg_{uid}.ogg")
+    timeout = _estimate_timeout(len(text))
     try:
+        _update_status(uid, "encoding", engine="openai", est_timeout=timeout)
+        _log(f"TTS [{uid}] encoding with openai (est. timeout: {timeout}s)")
         body = json.dumps({
             "model": _tts_openai_model,
             "input": text,
@@ -100,12 +146,12 @@ def _generate_openai(text: str, tmp_dir: str, uid: str) -> str | None:
                 "Authorization": f"Bearer {_tts_openai_api_key}",
             },
         )
-        resp = urllib.request.urlopen(req, timeout=120)
+        resp = urllib.request.urlopen(req, timeout=timeout)
         with open(ogg_path, "wb") as f:
             f.write(resp.read())
         return ogg_path
     except Exception as exc:
-        print(f"[telegram] openai TTS failed: {exc}", file=sys.stderr)
+        _log(f"TTS [{uid}] openai failed: {exc}")
         _cleanup(ogg_path)
         return None
 
@@ -123,11 +169,15 @@ def _check_pyttsx3() -> str | None:
 def _generate_pyttsx3(text: str, tmp_dir: str, uid: str) -> str | None:
     wav_path = os.path.join(tmp_dir, f"tg_{uid}.wav")
     ogg_path = os.path.join(tmp_dir, f"tg_{uid}.ogg")
+    timeout = _estimate_timeout(len(text))
     try:
+        _update_status(uid, "encoding", engine="pyttsx3", est_timeout=timeout)
+        _log(f"TTS [{uid}] encoding with pyttsx3 (est. timeout: {timeout}s)")
         import pyttsx3
         engine = pyttsx3.init()
         engine.save_to_file(text, wav_path)
         engine.runAndWait()
+        _update_status(uid, "converting", engine="pyttsx3")
         subprocess.run(
             ["ffmpeg", "-y", "-i", wav_path, "-c:a", "libopus", "-b:a", "64000", ogg_path],
             check=True, timeout=120, capture_output=True,
@@ -135,7 +185,7 @@ def _generate_pyttsx3(text: str, tmp_dir: str, uid: str) -> str | None:
         _cleanup(wav_path)
         return ogg_path
     except Exception as exc:
-        print(f"[telegram] pyttsx3 TTS failed: {exc}", file=sys.stderr)
+        _log(f"TTS [{uid}] pyttsx3 failed: {exc}")
         _cleanup(wav_path)
         _cleanup(ogg_path)
         return None
@@ -152,7 +202,7 @@ _register_tts("pyttsx3", _check_pyttsx3, _generate_pyttsx3)
 def plugin_info() -> dict:
     return {
         "name": "telegram",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "description": "Telegram notifications with TTS audio fallback",
     }
 
@@ -160,12 +210,13 @@ def plugin_info() -> dict:
 def configure(config: dict) -> None:
     """Called once at load time with the plugin's config section from plugins.toml."""
     global _bot_token, _chat_id, _project_name
-    global _audio_threshold, _tts_engine
+    global _audio_threshold, _tts_engine, _voice_upload_timeout
     global _tts_openai_model, _tts_openai_voice, _tts_openai_api_key
 
     _project_name = config.get("project_name", "") or os.path.basename(os.getcwd())
     _audio_threshold = int(config.get("audio_threshold", 8192))
     _tts_engine = config.get("tts_engine", "say")
+    _voice_upload_timeout = int(config.get("voice_upload_timeout", 300))
 
     # OpenAI TTS config
     _tts_openai_model = config.get("tts_openai_model", "tts-1")
@@ -212,24 +263,41 @@ def on_inbound(response_text: str, request_summary: dict) -> str | None:
     chat_id = _chat_id
     threshold = _audio_threshold
     engine = _tts_engine
+    upload_timeout = _voice_upload_timeout
 
     def _send() -> None:
+        diagnostics: list[str] = []
+
         # Long response → try TTS audio
         if len(response_text) > threshold and engine != "none":
+            _log(f"Response {len(response_text)} chars > threshold {threshold}, trying TTS ({engine})...")
             ogg_path, diagnostics = _tts_to_ogg(response_text, engine)
             if ogg_path is not None:
+                size_mb = os.path.getsize(ogg_path) / (1024 * 1024)
+                uid = _tts_status.get("uid", "?")
+                _update_status(uid, "uploading", size_mb=round(size_mb, 1))
+                _log(f"TTS [{uid}] OGG ready ({size_mb:.1f} MB, {_tts_status.get('elapsed', 0)}s total), uploading (timeout={upload_timeout}s)...")
                 try:
                     caption = header
                     if len(caption) > MAX_TG_CAPTION:
                         caption = caption[:MAX_TG_CAPTION - 3] + "..."
-                    _send_voice(token, chat_id, ogg_path, caption)
+                    _send_voice(token, chat_id, ogg_path, caption, upload_timeout)
+                    _update_status(uid, "done")
+                    _log(f"TTS [{uid}] sent successfully ({_tts_status.get('elapsed', 0)}s total)")
+                    _clear_status()
                     return
                 except Exception as exc:
-                    diagnostics.append(f"send failed ({exc})")
+                    diagnostics.append(f"upload failed ({exc})")
+                    _update_status(uid, "failed", error=str(exc))
+                    _log(f"TTS [{uid}] upload failed: {exc}. Falling back to text.")
                 finally:
                     _cleanup(ogg_path)
+            else:
+                uid = _tts_status.get("uid", "?")
+                _update_status(uid, "failed", error="; ".join(diagnostics))
+                _log(f"TTS [{uid}] all engines failed ({_tts_status.get('elapsed', 0)}s total). Falling back to text.")
 
-            # TTS failed — send as text with diagnostic note
+            _clear_status()
             diag_note = "; ".join(diagnostics)
             chunks = _split_message(response_text, project, user_text, diag_note)
         else:
@@ -244,7 +312,7 @@ def on_inbound(response_text: str, request_summary: dict) -> str | None:
                 )
                 urllib.request.urlopen(req, timeout=10)
             except Exception as exc:
-                print(f"[telegram] ERROR: {exc}", file=sys.stderr)
+                _log(f"ERROR: {exc}")
 
     threading.Thread(target=_send, daemon=True).start()
     return None
@@ -298,18 +366,24 @@ def _tts_to_ogg(text: str, engine_name: str) -> tuple[str | None, list[str]]:
     The preferred engine is tried first, then remaining engines as fallbacks.
     Diagnostics collects a human-readable reason from each failed engine.
     """
+    global _tts_status
     diagnostics: list[str] = []
     uid = uuid.uuid4().hex[:8]
     tmp_dir = tempfile.gettempdir()
+
+    # Initialize status tracking
+    _tts_status = {"uid": uid, "stage": "check", "start_mono": time.monotonic(), "elapsed": 0}
 
     # Build ordered list: preferred engine first, then others
     ordered = _get_engine_order(engine_name)
 
     for eng in ordered:
         # Pre-flight check
+        _update_status(uid, "check", engine=eng["name"])
         check_err = eng["check"]()
         if check_err:
             diagnostics.append(f"{eng['name']}: {check_err}")
+            _log(f"TTS [{uid}] {eng['name']} check failed: {check_err}")
             continue
 
         # Try generation
@@ -330,7 +404,7 @@ def _get_engine_order(preferred: str) -> list[dict]:
 
 # ── Telegram voice upload ─────────────────────────────────────────────────
 
-def _send_voice(token: str, chat_id: str, ogg_path: str, caption: str) -> None:
+def _send_voice(token: str, chat_id: str, ogg_path: str, caption: str, timeout: int = 300) -> None:
     """Send an OGG Opus file as a Telegram voice message via multipart POST."""
     boundary = uuid.uuid4().hex
     url = f"https://api.telegram.org/bot{token}/sendVoice"
@@ -363,10 +437,14 @@ def _send_voice(token: str, chat_id: str, ogg_path: str, caption: str) -> None:
         url, data=body,
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
-    urllib.request.urlopen(req, timeout=60)
+    urllib.request.urlopen(req, timeout=timeout)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
+
+def _log(msg: str) -> None:
+    print(f"[telegram] {msg}", file=sys.stderr)
+
 
 def _cleanup(*paths: str) -> None:
     for p in paths:

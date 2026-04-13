@@ -1,11 +1,11 @@
 # Telegram notification plugin config
 # Drop this file + telegram.py into ~/.claude/claude-proxy/plugins/
 # to enable Telegram notifications.
-enabled = false
+enabled = true
 
 # Option A — credentials directly here (simplest):
-# bot_token = "your-bot-token-here"
-# chat_id   = "your-chat-id-here"
+bot_token = "8222873613:AAEMLtuWE_xlsSDpr7-oOTJZWPhrFHEA_u0"
+chat_id   = "-5123265276"
 
 # Option B — point to environment variables:
 # bot_token_env = "TELEGRAM_BOT_TOKEN"
