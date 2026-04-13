@@ -45,7 +45,7 @@ def _discover_scanner() -> str | None:
     if not cache.exists():
         return None
     candidates = sorted(
-        cache.glob("*/hooks/scanner.py"),
+        cache.glob("**/hooks/scanner.py"),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
@@ -55,8 +55,14 @@ def _discover_scanner() -> str | None:
 def _load_scanner(path: str):
     """Import scanner.py from *path* via importlib. Returns module or None."""
     try:
+        # Set CLAUDE_PLUGIN_ROOT so scanner finds its rules/ and _vendor/ dirs
+        plugin_root = str(Path(path).resolve().parent.parent)
+        os.environ.setdefault("CLAUDE_PLUGIN_ROOT", plugin_root)
+
         spec = importlib.util.spec_from_file_location("_lg_scanner", path)
         mod = importlib.util.module_from_spec(spec)
+        # Register in sys.modules before exec — Python 3.9 dataclass needs this
+        sys.modules["_lg_scanner"] = mod
         spec.loader.exec_module(mod)  # type: ignore[union-attr]
         return mod
     except Exception as exc:
