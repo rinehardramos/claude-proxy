@@ -10,3 +10,18 @@ enabled = false
 # Option B — point to environment variables:
 # bot_token_env = "TELEGRAM_BOT_TOKEN"
 # chat_id_env   = "TELEGRAM_CHAT_ID"
+
+# Project name shown in message headers (defaults to cwd basename):
+# project_name = "my-project"
+
+# Response length (chars) before switching to TTS audio (default: 8192):
+# audio_threshold = 8192
+
+# TTS engine preference. First success wins, others tried as fallback.
+# Available: "say" (macOS), "openai", "pyttsx3", "none" (text only)
+# tts_engine = "say"
+
+# OpenAI TTS settings (used when engine is "openai"):
+# tts_openai_model = "tts-1"
+# tts_openai_voice = "alloy"
+# tts_openai_api_key_env = "OPENAI_API_KEY"

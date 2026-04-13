@@ -8,7 +8,7 @@ import threading
 import unittest
 import urllib.request
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 _PLUGIN_PATH = Path(__file__).parent.parent / "plugins" / "telegram.py"
 
@@ -45,6 +45,7 @@ class TestConfigure(unittest.TestCase):
         env = os.environ.copy()
         env.pop("TELEGRAM_BOT_TOKEN", None)
         env.pop("TELEGRAM_CHAT_ID", None)
+        env.pop("OPENAI_API_KEY", None)
         return env
 
     def test_reads_default_env_var_names(self):
@@ -118,26 +119,279 @@ class TestConfigure(unittest.TestCase):
         self.assertIsNone(self.t._bot_token)
         self.assertIsNone(self.t._chat_id)
 
+    def test_reads_project_name_from_config(self):
+        env = self._clean_env()
+        env["TELEGRAM_BOT_TOKEN"] = "tok"
+        env["TELEGRAM_CHAT_ID"] = "chat"
+        with patch.dict(os.environ, env, clear=True):
+            self.t.configure({"project_name": "my-project"})
+        self.assertEqual(self.t._project_name, "my-project")
+
+    def test_project_name_defaults_to_cwd_basename(self):
+        env = self._clean_env()
+        env["TELEGRAM_BOT_TOKEN"] = "tok"
+        env["TELEGRAM_CHAT_ID"] = "chat"
+        with patch.dict(os.environ, env, clear=True):
+            self.t.configure({})
+        self.assertEqual(self.t._project_name, os.path.basename(os.getcwd()))
+
+    def test_reads_audio_threshold_from_config(self):
+        env = self._clean_env()
+        env["TELEGRAM_BOT_TOKEN"] = "tok"
+        env["TELEGRAM_CHAT_ID"] = "chat"
+        with patch.dict(os.environ, env, clear=True):
+            self.t.configure({"audio_threshold": 16384})
+        self.assertEqual(self.t._audio_threshold, 16384)
+
+    def test_audio_threshold_defaults_to_8192(self):
+        env = self._clean_env()
+        env["TELEGRAM_BOT_TOKEN"] = "tok"
+        env["TELEGRAM_CHAT_ID"] = "chat"
+        with patch.dict(os.environ, env, clear=True):
+            self.t.configure({})
+        self.assertEqual(self.t._audio_threshold, 8192)
+
+    def test_reads_tts_engine_from_config(self):
+        env = self._clean_env()
+        env["TELEGRAM_BOT_TOKEN"] = "tok"
+        env["TELEGRAM_CHAT_ID"] = "chat"
+        with patch.dict(os.environ, env, clear=True):
+            self.t.configure({"tts_engine": "openai"})
+        self.assertEqual(self.t._tts_engine, "openai")
+
+    def test_tts_engine_defaults_to_say(self):
+        env = self._clean_env()
+        env["TELEGRAM_BOT_TOKEN"] = "tok"
+        env["TELEGRAM_CHAT_ID"] = "chat"
+        with patch.dict(os.environ, env, clear=True):
+            self.t.configure({})
+        self.assertEqual(self.t._tts_engine, "say")
+
+    def test_reads_openai_tts_config(self):
+        env = self._clean_env()
+        env["TELEGRAM_BOT_TOKEN"] = "tok"
+        env["TELEGRAM_CHAT_ID"] = "chat"
+        env["OPENAI_API_KEY"] = "sk-test"
+        with patch.dict(os.environ, env, clear=True):
+            self.t.configure({"tts_openai_model": "tts-1-hd", "tts_openai_voice": "nova"})
+        self.assertEqual(self.t._tts_openai_model, "tts-1-hd")
+        self.assertEqual(self.t._tts_openai_voice, "nova")
+        self.assertEqual(self.t._tts_openai_api_key, "sk-test")
+
+    def test_openai_api_key_from_custom_env(self):
+        env = self._clean_env()
+        env["TELEGRAM_BOT_TOKEN"] = "tok"
+        env["TELEGRAM_CHAT_ID"] = "chat"
+        env["MY_OAI_KEY"] = "sk-custom"
+        with patch.dict(os.environ, env, clear=True):
+            self.t.configure({"tts_openai_api_key_env": "MY_OAI_KEY"})
+        self.assertEqual(self.t._tts_openai_api_key, "sk-custom")
+
+
+# ── TTS Registry ─────────────────────────────────────────────────────────
+
+class TestTTSRegistry(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+
+    def test_builtin_engines_registered(self):
+        names = [e["name"] for e in self.t._TTS_REGISTRY]
+        self.assertIn("say", names)
+        self.assertIn("openai", names)
+        self.assertIn("pyttsx3", names)
+
+    def test_register_custom_engine(self):
+        self.t._register_tts("custom", lambda: None, lambda t, d, u: None)
+        names = [e["name"] for e in self.t._TTS_REGISTRY]
+        self.assertIn("custom", names)
+
+    def test_preferred_engine_tried_first(self):
+        order = self.t._get_engine_order("pyttsx3")
+        self.assertEqual(order[0]["name"], "pyttsx3")
+
+    def test_preferred_engine_unknown_puts_all_in_default_order(self):
+        order = self.t._get_engine_order("nonexistent")
+        names = [e["name"] for e in order]
+        self.assertEqual(names, [e["name"] for e in self.t._TTS_REGISTRY])
+
+
+class TestTTSChecks(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+
+    def test_check_say_missing_say_command(self):
+        with patch("shutil.which", return_value=None):
+            err = self.t._check_say()
+        self.assertIn("say command not found", err)
+
+    def test_check_say_missing_ffmpeg(self):
+        def which(cmd):
+            return "/usr/bin/say" if cmd == "say" else None
+        with patch("shutil.which", side_effect=which):
+            err = self.t._check_say()
+        self.assertIn("ffmpeg", err)
+
+    def test_check_say_all_present(self):
+        with patch("shutil.which", return_value="/usr/bin/found"):
+            err = self.t._check_say()
+        self.assertIsNone(err)
+
+    def test_check_openai_missing_key(self):
+        self.t._tts_openai_api_key = None
+        err = self.t._check_openai()
+        self.assertIn("OPENAI_API_KEY", err)
+
+    def test_check_openai_with_key(self):
+        self.t._tts_openai_api_key = "sk-test"
+        err = self.t._check_openai()
+        self.assertIsNone(err)
+
+    def test_check_pyttsx3_not_installed(self):
+        with patch.dict("sys.modules", {"pyttsx3": None}), \
+             patch("shutil.which", return_value="/usr/bin/ffmpeg"):
+            err = self.t._check_pyttsx3()
+        self.assertIn("pyttsx3 not installed", err)
+
+    def test_check_pyttsx3_missing_ffmpeg(self):
+        mock_mod = MagicMock()
+        with patch.dict("sys.modules", {"pyttsx3": mock_mod}), \
+             patch("shutil.which", return_value=None):
+            err = self.t._check_pyttsx3()
+        self.assertIn("ffmpeg", err)
+
+
+class TestTTSToOgg(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+
+    def test_returns_diagnostics_when_all_fail(self):
+        # Make all checks fail
+        for eng in self.t._TTS_REGISTRY:
+            eng["check"] = lambda: "not available"
+        ogg, diags = self.t._tts_to_ogg("hello", "say")
+        self.assertIsNone(ogg)
+        self.assertGreater(len(diags), 0)
+        self.assertTrue(all("not available" in d for d in diags))
+
+    def test_returns_path_on_first_success(self):
+        # First engine fails check, second succeeds
+        self.t._TTS_REGISTRY.clear()
+        self.t._register_tts("fail", lambda: "broken", lambda t, d, u: None)
+        self.t._register_tts("ok", lambda: None, lambda t, d, u: "/tmp/test.ogg")
+        ogg, diags = self.t._tts_to_ogg("hello", "fail")
+        self.assertEqual(ogg, "/tmp/test.ogg")
+        self.assertEqual(len(diags), 1)
+        self.assertIn("broken", diags[0])
+
+    def test_skips_check_failure_tries_next(self):
+        call_order = []
+        self.t._TTS_REGISTRY.clear()
+        self.t._register_tts("a", lambda: "nope", lambda t, d, u: None)
+
+        def gen_b(t, d, u):
+            call_order.append("b")
+            return "/tmp/b.ogg"
+
+        self.t._register_tts("b", lambda: None, gen_b)
+        ogg, _ = self.t._tts_to_ogg("text", "a")
+        self.assertEqual(ogg, "/tmp/b.ogg")
+        self.assertIn("b", call_order)
+
+    def test_generation_failure_adds_diagnostic(self):
+        self.t._TTS_REGISTRY.clear()
+        self.t._register_tts("flaky", lambda: None, lambda t, d, u: None)
+        ogg, diags = self.t._tts_to_ogg("text", "flaky")
+        self.assertIsNone(ogg)
+        self.assertTrue(any("generation failed" in d for d in diags))
+
+
+# ── Message splitting ─────────────────────────────────────────────────────
+
+class TestSplitMessage(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+
+    def test_short_response_single_chunk(self):
+        chunks = self.t._split_message("Hello world", "myproj", "What?")
+        self.assertEqual(len(chunks), 1)
+        self.assertIn("Project: myproj", chunks[0])
+        self.assertIn('Prompt: "What?"', chunks[0])
+        self.assertIn("Hello world", chunks[0])
+
+    def test_first_chunk_has_full_prompt(self):
+        long_prompt = "x" * 500
+        chunks = self.t._split_message("short", "proj", long_prompt)
+        self.assertIn(long_prompt, chunks[0])
+
+    def test_prompt_not_truncated(self):
+        long_prompt = "y" * 300
+        chunks = self.t._split_message("body", "proj", long_prompt)
+        self.assertIn(long_prompt, chunks[0])
+        self.assertNotIn("...", chunks[0])
+
+    def test_multi_chunk_has_numbered_headers(self):
+        big = "A" * 10000
+        chunks = self.t._split_message(big, "proj", "q")
+        self.assertGreater(len(chunks), 1)
+        self.assertIn('Prompt: "q"', chunks[0])
+        for i, chunk in enumerate(chunks[1:], start=2):
+            self.assertIn(f"Project: proj [{i}/{len(chunks)}]", chunk)
+
+    def test_subsequent_chunks_no_prompt(self):
+        big = "B" * 10000
+        chunks = self.t._split_message(big, "proj", "question")
+        for chunk in chunks[1:]:
+            self.assertNotIn("Prompt:", chunk)
+
+    def test_each_chunk_within_max_length(self):
+        big = "C" * 15000
+        chunks = self.t._split_message(big, "proj", "q")
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), self.t.MAX_TG_LENGTH)
+
+    def test_all_content_preserved(self):
+        response = "D" * 10000
+        chunks = self.t._split_message(response, "proj", "q")
+        combined = ""
+        for i, chunk in enumerate(chunks):
+            lines = chunk.split("\n")
+            if i == 0:
+                combined += "\n".join(lines[2:])
+            else:
+                combined += "\n".join(lines[1:])
+        self.assertEqual(combined, response)
+
+    def test_diagnostic_note_included_in_first_chunk(self):
+        chunks = self.t._split_message("body", "proj", "q", "say: ffmpeg not found")
+        self.assertIn("Audio unavailable: say: ffmpeg not found", chunks[0])
+        self.assertIn("Sending as text.", chunks[0])
+
+    def test_no_diagnostic_note_when_none(self):
+        chunks = self.t._split_message("body", "proj", "q")
+        self.assertNotIn("Audio unavailable", chunks[0])
+
+
+# ── on_inbound integration ───────────────────────────────────────────────
 
 class TestOnInbound(unittest.TestCase):
     def setUp(self):
         self.t = _load()
         env = {"TELEGRAM_BOT_TOKEN": "test-token", "TELEGRAM_CHAT_ID": "99999"}
         with patch.dict(os.environ, env, clear=False):
-            self.t.configure({})
+            self.t.configure({"tts_engine": "none"})
 
     def _call_and_capture(self, response_text, request_summary):
-        """Call on_inbound and block until the daemon thread finishes its send."""
-        done = threading.Event()
+        """Call on_inbound and block until the daemon thread finishes all sends."""
         captured = []
 
         def mock_urlopen(req, timeout=None):
             captured.append(req)
-            done.set()
 
         with patch.object(urllib.request, "urlopen", side_effect=mock_urlopen):
             result = self.t.on_inbound(response_text, request_summary)
-            done.wait(timeout=2)
+            for t in threading.enumerate():
+                if t.daemon and t is not threading.current_thread():
+                    t.join(timeout=2)
 
         return result, captured
 
@@ -158,26 +412,40 @@ class TestOnInbound(unittest.TestCase):
         body = json.loads(captured[0].data.decode())
         self.assertIn("What is 2+2?", body["text"])
 
-    def test_message_contains_response_char_count(self):
-        _, captured = self._call_and_capture("A" * 500, {"user_text": "q"})
+    def test_message_contains_full_response(self):
+        _, captured = self._call_and_capture("The answer is 4", {"user_text": "q"})
         body = json.loads(captured[0].data.decode())
-        self.assertIn("500 chars", body["text"])
+        self.assertIn("The answer is 4", body["text"])
 
-    def test_message_format_prefix(self):
+    def test_message_format_has_project_and_prompt(self):
         _, captured = self._call_and_capture("hello", {"user_text": "Say hi"})
         body = json.loads(captured[0].data.decode())
-        self.assertTrue(body["text"].startswith('Claude responded to: "Say hi"'))
+        self.assertIn("Project:", body["text"])
+        self.assertIn('Prompt: "Say hi"', body["text"])
 
-    def test_user_text_truncated_at_100_with_ellipsis(self):
-        long_text = "x" * 200
-        _, captured = self._call_and_capture("resp", {"user_text": long_text})
+    def test_full_prompt_not_truncated(self):
+        long_prompt = "z" * 300
+        _, captured = self._call_and_capture("resp", {"user_text": long_prompt})
         body = json.loads(captured[0].data.decode())
-        self.assertIn("x" * 100 + "...", body["text"])
+        self.assertIn(long_prompt, body["text"])
 
-    def test_short_user_text_not_truncated(self):
-        _, captured = self._call_and_capture("resp", {"user_text": "short"})
-        body = json.loads(captured[0].data.decode())
-        self.assertNotIn("...", body["text"])
+    def test_long_response_split_into_multiple_messages(self):
+        big_response = "A" * 5000
+        _, captured = self._call_and_capture(big_response, {"user_text": "q"})
+        self.assertGreater(len(captured), 1)
+        full = "".join(json.loads(c.data.decode())["text"] for c in captured)
+        self.assertEqual(full.count("A"), 5000)
+
+    def test_short_response_sends_single_message(self):
+        _, captured = self._call_and_capture("short reply", {"user_text": "q"})
+        self.assertEqual(len(captured), 1)
+
+    def test_each_chunk_within_max_length(self):
+        big_response = "B" * 8000
+        _, captured = self._call_and_capture(big_response, {"user_text": "q"})
+        for req in captured:
+            body = json.loads(req.data.decode())
+            self.assertLessEqual(len(body["text"]), self.t.MAX_TG_LENGTH)
 
     def test_sends_to_correct_chat_id(self):
         _, captured = self._call_and_capture("resp", {"user_text": "test"})
@@ -208,6 +476,211 @@ class TestOnInbound(unittest.TestCase):
     def test_missing_user_text_key_handled(self):
         _, captured = self._call_and_capture("response", {"model": "claude"})
         self.assertEqual(len(captured), 1)
+
+
+class TestTTSPathIntegration(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+        env = {"TELEGRAM_BOT_TOKEN": "test-token", "TELEGRAM_CHAT_ID": "99999"}
+        with patch.dict(os.environ, env, clear=False):
+            self.t.configure({"tts_engine": "say", "audio_threshold": 100})
+
+    def test_long_response_triggers_audio_path(self):
+        fake_ogg = os.path.join(os.path.dirname(__file__), "_test_voice.ogg")
+        with open(fake_ogg, "wb") as f:
+            f.write(b"fake-ogg-data")
+
+        voice_sent = []
+
+        def mock_urlopen(req, timeout=None):
+            voice_sent.append(req)
+
+        try:
+            with patch.object(self.t, "_tts_to_ogg", return_value=(fake_ogg, [])) as mock_tts, \
+                 patch.object(urllib.request, "urlopen", side_effect=mock_urlopen):
+                self.t.on_inbound("A" * 200, {"user_text": "long query"})
+                for t in threading.enumerate():
+                    if t.daemon and t is not threading.current_thread():
+                        t.join(timeout=2)
+
+            mock_tts.assert_called_once()
+            self.assertEqual(len(voice_sent), 1)
+            self.assertIn("sendVoice", voice_sent[0].full_url)
+        finally:
+            try:
+                os.remove(fake_ogg)
+            except OSError:
+                pass
+
+    def test_tts_failure_falls_back_to_text_with_diagnostic(self):
+        captured = []
+
+        def mock_urlopen(req, timeout=None):
+            captured.append(req)
+
+        with patch.object(self.t, "_tts_to_ogg", return_value=(None, ["say: ffmpeg not found"])), \
+             patch.object(urllib.request, "urlopen", side_effect=mock_urlopen):
+            self.t.on_inbound("A" * 200, {"user_text": "q"})
+            for t in threading.enumerate():
+                if t.daemon and t is not threading.current_thread():
+                    t.join(timeout=2)
+
+        self.assertGreater(len(captured), 0)
+        self.assertIn("sendMessage", captured[0].full_url)
+        body = json.loads(captured[0].data.decode())
+        self.assertIn("Audio unavailable", body["text"])
+        self.assertIn("ffmpeg not found", body["text"])
+
+    def test_engine_none_skips_audio_no_diagnostic(self):
+        self.t._tts_engine = "none"
+        captured = []
+
+        def mock_urlopen(req, timeout=None):
+            captured.append(req)
+
+        with patch.object(urllib.request, "urlopen", side_effect=mock_urlopen):
+            self.t.on_inbound("A" * 200, {"user_text": "q"})
+            for t in threading.enumerate():
+                if t.daemon and t is not threading.current_thread():
+                    t.join(timeout=2)
+
+        for req in captured:
+            self.assertIn("sendMessage", req.full_url)
+            body = json.loads(req.data.decode())
+            self.assertNotIn("Audio unavailable", body["text"])
+
+
+# ── TTS engine generate functions ────────────────────────────────────────
+
+class TestGenerateSay(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+
+    def test_say_success_returns_ogg_path(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = self.t._generate_say("hello", "/tmp", "abc")
+        self.assertIsNotNone(result)
+        self.assertTrue(result.endswith(".ogg"))
+        self.assertEqual(mock_run.call_count, 2)
+
+    def test_say_failure_returns_none(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError("say not found")):
+            result = self.t._generate_say("hello", "/tmp", "abc")
+        self.assertIsNone(result)
+
+
+class TestGenerateOpenAI(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+        self.t._tts_openai_api_key = "sk-test"
+        self.t._tts_openai_model = "tts-1"
+        self.t._tts_openai_voice = "alloy"
+
+    def test_openai_success_returns_ogg_path(self):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b"fake-opus-audio"
+
+        with patch.object(urllib.request, "urlopen", return_value=mock_resp):
+            result = self.t._generate_openai("hello world", "/tmp", "oai1")
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.endswith(".ogg"))
+        # Cleanup the file
+        try:
+            os.remove(result)
+        except OSError:
+            pass
+
+    def test_openai_sends_correct_request(self):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b"audio"
+        captured = []
+
+        def mock_urlopen(req, timeout=None):
+            captured.append(req)
+            return mock_resp
+
+        with patch.object(urllib.request, "urlopen", side_effect=mock_urlopen):
+            result = self.t._generate_openai("test text", "/tmp", "oai2")
+
+        self.assertEqual(len(captured), 1)
+        req = captured[0]
+        self.assertIn("api.openai.com", req.full_url)
+        self.assertIn("audio/speech", req.full_url)
+        body = json.loads(req.data.decode())
+        self.assertEqual(body["model"], "tts-1")
+        self.assertEqual(body["voice"], "alloy")
+        self.assertEqual(body["input"], "test text")
+        self.assertEqual(body["response_format"], "opus")
+        self.assertIn("Bearer sk-test", req.get_header("Authorization"))
+        # Cleanup
+        try:
+            os.remove(result)
+        except OSError:
+            pass
+
+    def test_openai_failure_returns_none(self):
+        with patch.object(urllib.request, "urlopen", side_effect=Exception("API error")):
+            result = self.t._generate_openai("hello", "/tmp", "oai3")
+        self.assertIsNone(result)
+
+
+class TestGeneratePyttsx3(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+
+    def test_pyttsx3_import_failure_returns_none(self):
+        with patch.dict("sys.modules", {"pyttsx3": None}):
+            result = self.t._generate_pyttsx3("hello", "/tmp", "abc")
+        self.assertIsNone(result)
+
+
+# ── Telegram voice upload ────────────────────────────────────────────────
+
+class TestSendVoice(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+
+    def test_sends_multipart_to_send_voice_endpoint(self):
+        import tempfile
+        ogg = os.path.join(tempfile.gettempdir(), "test_voice.ogg")
+        with open(ogg, "wb") as f:
+            f.write(b"fake-ogg")
+
+        captured = []
+
+        def mock_urlopen(req, timeout=None):
+            captured.append(req)
+
+        try:
+            with patch.object(urllib.request, "urlopen", side_effect=mock_urlopen):
+                self.t._send_voice("tok", "123", ogg, "caption here")
+            self.assertEqual(len(captured), 1)
+            self.assertIn("sendVoice", captured[0].full_url)
+            self.assertIn(b"fake-ogg", captured[0].data)
+            self.assertIn(b"caption here", captured[0].data)
+            self.assertIn("multipart/form-data", captured[0].get_header("Content-type"))
+        finally:
+            os.remove(ogg)
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────
+
+class TestCleanup(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+
+    def test_removes_existing_file(self):
+        import tempfile
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        self.assertTrue(os.path.exists(path))
+        self.t._cleanup(path)
+        self.assertFalse(os.path.exists(path))
+
+    def test_missing_file_no_error(self):
+        self.t._cleanup("/nonexistent/path/file.ogg")
 
 
 if __name__ == "__main__":
