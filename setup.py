@@ -392,6 +392,61 @@ def proxy_status(port: int = 18019) -> dict | None:
 
 # ── Install / Uninstall orchestration ─────────────────────────────────────
 
+PRETOOLUSE_HOOK_MARKER = "claude-proxy-hook"
+
+
+def patch_pretooluse_hook(settings_path: Path, proxy_py: Path) -> None:
+    """Register the proxy's unified PreToolUse dispatcher in settings.json.
+
+    A single entry: ``proxy.py --hook pre-tool`` dispatches to all plugin
+    hook scripts in ~/.claude/claude-proxy/hooks/.  Plugins are added/removed
+    without touching settings.json — only their hook scripts and .toml configs.
+
+    Idempotent — does nothing if the marker is already present.
+    """
+    if settings_path.exists():
+        try:
+            data = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            data = {}
+    else:
+        data = {}
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+    hooks = data.setdefault("hooks", {})
+    pretooluse = hooks.setdefault("PreToolUse", [])
+
+    # Idempotency
+    if any(PRETOOLUSE_HOOK_MARKER in json.dumps(entry) for entry in pretooluse):
+        return
+
+    command = f"python3 {proxy_py} --hook pre-tool  # {PRETOOLUSE_HOOK_MARKER}"
+    pretooluse.append({
+        "hooks": [{"type": "command", "command": command, "timeout": 660}],
+    })
+
+    settings_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def unpatch_pretooluse_hook(settings_path: Path) -> None:
+    """Remove the proxy's PreToolUse dispatcher from settings.json."""
+    if not settings_path.exists():
+        return
+    try:
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+
+    pretooluse = data.get("hooks", {}).get("PreToolUse", [])
+    filtered = [e for e in pretooluse if PRETOOLUSE_HOOK_MARKER not in json.dumps(e)]
+    data.setdefault("hooks", {})["PreToolUse"] = filtered
+
+    if not filtered:
+        data["hooks"].pop("PreToolUse", None)
+
+    settings_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
 def install(
     project_dir: Path | None = None,
     state_dir: Path | None = None,
@@ -417,6 +472,9 @@ def install(
 
     print(f"[claude-proxy] Patching {settings_path}...")
     patch_settings_json(settings_path, proxy_py)
+
+    print("[claude-proxy] Registering PreToolUse hook dispatcher...")
+    patch_pretooluse_hook(settings_path, proxy_py)
 
     print(f"[claude-proxy] Patching {shell_profile}...")
     patch_shell_profile(shell_profile, proxy_py)
@@ -455,6 +513,7 @@ def uninstall(
     if state_dir.exists():
         shutil.rmtree(state_dir)
 
+    unpatch_pretooluse_hook(settings_path)
     print(f"[claude-proxy] Removing hook from {settings_path}...")
     unpatch_settings_json(settings_path)
 
