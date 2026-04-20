@@ -1,0 +1,22 @@
+# Async task result watcher plugin config
+# Polls control-plane API for completed tasks and injects results
+# into Claude's response stream automatically.
+enabled = true
+
+# Control-plane API base URL (required)
+control_api_url = "http://localhost:8100"
+
+# Or point to an env var (default: CONTROL_API_URL)
+# control_api_url_env = "CONTROL_API_URL"
+
+# API key for X-Control-API-Key header (required if API uses auth)
+# control_api_key = "your-key"
+
+# Or point to an env var (default: CONTROL_API_KEY)
+# control_api_key_env = "CONTROL_API_KEY"
+
+# HTTP timeout for status checks (seconds, default: 5)
+# check_timeout = 5
+
+# Stop polling tasks older than this (seconds, default: 86400 = 24h)
+# task_ttl = 86400
