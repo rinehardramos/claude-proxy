@@ -1,0 +1,3 @@
+# leak-guard proxy plugin config
+# Redacts secrets/PII from outbound payloads before they reach Anthropic.
+enabled = true
