@@ -1026,8 +1026,6 @@ class TestServerBindAndRespond(unittest.TestCase):
 
 
 def test_plugin_manager_tracks_reload_count(tmp_path):
-    from proxy import PluginManager
-
     plugins_dir = tmp_path / "plugins"
     plugins_dir.mkdir()
     (plugins_dir / "dummy.py").write_text(
@@ -1047,8 +1045,6 @@ def test_plugin_manager_tracks_reload_count(tmp_path):
 
 def test_plugin_manager_deferred_swap_increments_reload_count(tmp_path):
     """Deferred path: reload queued while a request is in-flight, applied on exit."""
-    from proxy import PluginManager
-
     plugins_dir = tmp_path / "plugins"
     plugins_dir.mkdir()
     (plugins_dir / "dummy.py").write_text(
