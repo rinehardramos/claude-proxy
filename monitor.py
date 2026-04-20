@@ -144,6 +144,26 @@ class ResourceMonitor:
         self._last_recycle_at = self._clock()
         self._last_recycle_reason = reason
 
+    def start(self, on_recycle: Callable[[Breach], None], interval_s: float = 60.0) -> None:
+        self._stop_event = threading.Event()
+
+        def loop():
+            while not self._stop_event.wait(interval_s):
+                breach = self.should_recycle()
+                if breach is not None:
+                    self.mark_recycled(breach.reason)
+                    try:
+                        on_recycle(breach)
+                    except Exception as exc:
+                        print(f"[monitor] on_recycle callback failed: {exc}", file=sys.stderr)
+
+        self._thread = threading.Thread(target=loop, daemon=True, name="ResourceMonitor")
+        self._thread.start()
+
+    def stop(self) -> None:
+        if hasattr(self, "_stop_event"):
+            self._stop_event.set()
+
     def snapshot(self) -> dict:
         metrics = self._metrics()
         warnings: list[str] = []

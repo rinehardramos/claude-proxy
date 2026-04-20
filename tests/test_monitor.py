@@ -1,4 +1,6 @@
-from monitor import collect_metrics, evaluate_thresholds, Thresholds, ResourceMonitor
+import threading
+
+from monitor import collect_metrics, evaluate_thresholds, Thresholds, ResourceMonitor, Breach
 
 
 def test_collect_metrics_returns_expected_keys():
@@ -125,3 +127,23 @@ def test_monitor_snapshot_warnings_when_near_cap():
     )
     snap = mon.snapshot()
     assert any("rss" in w for w in snap["warnings"])
+
+
+def test_monitor_watch_invokes_on_recycle_callback():
+    called: list[Breach] = []
+    done = threading.Event()
+
+    def on_breach(breach):
+        called.append(breach)
+        done.set()
+
+    # metrics breach immediately
+    mon = ResourceMonitor(
+        thresholds=Thresholds(rss_mb=10),
+        get_reload_count=lambda: 0,
+        metrics_source=lambda: {"rss_mb": 500, "threads": 8, "fds": 14, "fd_limit": 1024},
+    )
+    mon.start(on_recycle=on_breach, interval_s=0.01)
+    assert done.wait(timeout=2.0), "on_recycle was not invoked within 2s"
+    mon.stop()
+    assert called[0].reason == "rss_exceeded"
