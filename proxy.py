@@ -1180,7 +1180,7 @@ def main():
                 try:
                     notify(breach.reason, breach.value, breach.threshold)
                 except Exception as exc:
-                    print(f"[monitor] telegram notify failed: {exc}", file=sys.stderr)
+                    print(f"[monitor] telegram notify failed: {exc}", file=sys.stderr, flush=True)
         os._exit(75)
 
     resource_monitor.start(on_recycle=_on_recycle, interval_s=60.0)
