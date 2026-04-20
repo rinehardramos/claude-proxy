@@ -111,9 +111,26 @@ def _redact_content(content: Any) -> Any:
         for block in content:
             if isinstance(block, dict) and block.get("type") == "text":
                 block = {**block, "text": _redact_text(block.get("text", ""))}
+            elif isinstance(block, dict) and block.get("type") == "tool_result":
+                block = {**block, "content": _redact_content(block.get("content", ""))}
             result.append(block)
         return result
     return content
+
+
+def _redact_tool_input(inp: dict) -> dict:
+    """Redact secrets/PII in tool_use input dict values (recursive)."""
+    result = {}
+    for k, v in inp.items():
+        if isinstance(v, str):
+            result[k] = _redact_text(v)
+        elif isinstance(v, dict):
+            result[k] = _redact_tool_input(v)
+        elif isinstance(v, list):
+            result[k] = [_redact_text(i) if isinstance(i, str) else i for i in v]
+        else:
+            result[k] = v
+    return result
 
 
 def on_outbound(payload: dict) -> dict:
@@ -140,9 +157,20 @@ def on_outbound(payload: dict) -> dict:
             for b in system
         ]
 
-    # User messages only
+    # User messages (text + tool_result blocks)
     for msg in payload.get("messages", []):
         if msg.get("role") == "user":
             msg["content"] = _redact_content(msg.get("content", ""))
+
+    # Assistant messages — scan tool_use input values in conversation history
+    for msg in payload.get("messages", []):
+        if msg.get("role") == "assistant":
+            content = msg.get("content")
+            if isinstance(content, list):
+                for i, block in enumerate(content):
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        inp = block.get("input")
+                        if isinstance(inp, dict):
+                            content[i] = {**block, "input": _redact_tool_input(inp)}
 
     return payload

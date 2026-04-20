@@ -136,11 +136,88 @@ class TestOnOutbound(unittest.TestCase):
         result = self.mod.on_outbound(payload)
         self.assertNotIn(_SECRET, result["messages"][0]["content"][0]["text"])
 
-    def test_assistant_messages_not_scanned(self):
-        # Assistant content is inbound — must not be modified
+    def test_assistant_text_not_scanned(self):
+        # Assistant text content is inbound — must not be modified
         payload = {"messages": [{"role": "assistant", "content": _SECRET}]}
         result = self.mod.on_outbound(payload)
         self.assertEqual(result["messages"][0]["content"], _SECRET)
+
+    def test_redacts_tool_use_input_in_assistant_message(self):
+        payload = {"messages": [{
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "tu_1", "name": "Bash",
+                 "input": {"command": f"curl -H 'Auth: {_SECRET}'"}},
+            ],
+        }]}
+        result = self.mod.on_outbound(payload)
+        self.assertNotIn(_SECRET, result["messages"][0]["content"][0]["input"]["command"])
+        self.assertIn("[REDACTED:test-secret:", result["messages"][0]["content"][0]["input"]["command"])
+
+    def test_redacts_tool_result_in_user_message(self):
+        payload = {"messages": [{
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "tu_1",
+                 "content": f"output contains {_SECRET} here"},
+            ],
+        }]}
+        result = self.mod.on_outbound(payload)
+        self.assertNotIn(_SECRET, result["messages"][0]["content"][0]["content"])
+        self.assertIn("[REDACTED:test-secret:", result["messages"][0]["content"][0]["content"])
+
+    def test_redacts_tool_result_with_block_list_content(self):
+        payload = {"messages": [{
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "tu_1",
+                 "content": [{"type": "text", "text": f"has {_SECRET}"}]},
+            ],
+        }]}
+        result = self.mod.on_outbound(payload)
+        inner = result["messages"][0]["content"][0]["content"][0]["text"]
+        self.assertNotIn(_SECRET, inner)
+
+    def test_redact_tool_input_recursive(self):
+        payload = {"messages": [{
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "tu_2", "name": "Write",
+                 "input": {"file_path": "/tmp/x", "content": f"key={_SECRET}",
+                           "nested": {"deep": f"val={_SECRET}"}}},
+            ],
+        }]}
+        result = self.mod.on_outbound(payload)
+        inp = result["messages"][0]["content"][0]["input"]
+        self.assertNotIn(_SECRET, inp["content"])
+        self.assertNotIn(_SECRET, inp["nested"]["deep"])
+
+    def test_redact_tool_input_list_values(self):
+        payload = {"messages": [{
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "tu_3", "name": "Custom",
+                 "input": {"args": [f"--token={_SECRET}", "clean"]}},
+            ],
+        }]}
+        result = self.mod.on_outbound(payload)
+        args = result["messages"][0]["content"][0]["input"]["args"]
+        self.assertNotIn(_SECRET, args[0])
+        self.assertEqual(args[1], "clean")
+
+    def test_non_string_tool_input_passthrough(self):
+        payload = {"messages": [{
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "tu_4", "name": "Bash",
+                 "input": {"timeout": 30, "background": True, "command": "ls"}},
+            ],
+        }]}
+        result = self.mod.on_outbound(payload)
+        inp = result["messages"][0]["content"][0]["input"]
+        self.assertEqual(inp["timeout"], 30)
+        self.assertEqual(inp["background"], True)
+        self.assertEqual(inp["command"], "ls")
 
     def test_clean_payload_returned_unchanged(self):
         payload = {"system": "no secrets here", "messages": []}
