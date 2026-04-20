@@ -392,6 +392,43 @@ def proxy_status(port: int = 18019) -> dict | None:
 
 # ── Install / Uninstall orchestration ─────────────────────────────────────
 
+def ensure_approval_config(plugins_dir: Path) -> None:
+    """Ensure telegram.toml has approval_poller enabled for the hook to work."""
+    toml_path = plugins_dir / "telegram.toml"
+    if not toml_path.exists():
+        return
+    text = toml_path.read_text(encoding="utf-8")
+    if "approval_poller" in text and not text.count("# approval_poller"):
+        return  # already has an uncommented approval_poller line
+    # Append the config if not present at all, or uncomment if commented
+    if "approval_poller" not in text:
+        text += (
+            '\n# Remote approval via Telegram inline buttons.\n'
+            'approval_poller = "true"\n'
+            'approval_scanner = "always"\n'
+        )
+    else:
+        # Replace commented line with active one
+        text = text.replace('# approval_poller = "true"', 'approval_poller = "true"')
+    toml_path.write_text(text, encoding="utf-8")
+
+
+def install_hooks(src_dir: Path, dst_dir: Path) -> None:
+    """Copy hook scripts from src_dir/hooks/ to dst_dir/hooks/.
+
+    Always overwrites .py files (code updates).
+    """
+    src_hooks = src_dir / "hooks"
+    if not src_hooks.exists():
+        return
+    dst_hooks = dst_dir / "hooks"
+    dst_hooks.mkdir(parents=True, exist_ok=True)
+    for py_file in src_hooks.glob("*.py"):
+        dst = dst_hooks / py_file.name
+        dst.write_bytes(py_file.read_bytes())
+        dst.chmod(0o755)
+
+
 PRETOOLUSE_HOOK_MARKER = "claude-proxy-hook"
 
 
@@ -490,7 +527,7 @@ Next steps:
   2. Restart Claude Code -- the proxy will start automatically.
   3. Verify:              curl -s http://127.0.0.1:18019/status
 
-To enable Telegram notifications:
+To enable Telegram notifications + remote approval:
   python3 setup.py add-plugin telegram
   Edit ~/.claude/claude-proxy/plugins/telegram.toml with your credentials.
 """.format(profile=shell_profile))
@@ -546,6 +583,34 @@ def cmd_uninstall(args: argparse.Namespace) -> None:
     uninstall()
 
 
+def _post_enable_telegram(state_dir: Path, project_dir: Path) -> None:
+    """Set up telegram plugin dependencies: deploy hook scripts, enable poller."""
+    install_hooks(project_dir, state_dir)
+    ensure_approval_config(state_dir / "plugins")
+    print("  [telegram] Deployed hook scripts + enabled approval poller.")
+    print("  [telegram] Restart Claude Code sessions for changes to take effect.")
+
+
+def _post_disable_telegram(state_dir: Path) -> None:
+    """Clean up telegram plugin dependencies: remove hook scripts, disable poller."""
+    toml_path = state_dir / "plugins" / "telegram.toml"
+    if toml_path.exists():
+        text = toml_path.read_text(encoding="utf-8")
+        if 'approval_poller = "true"' in text:
+            text = text.replace('approval_poller = "true"', '# approval_poller = "true"')
+            toml_path.write_text(text, encoding="utf-8")
+    hooks_dir = state_dir / "hooks"
+    telegram_hook = hooks_dir / "telegram_approve.py"
+    if telegram_hook.exists():
+        telegram_hook.unlink()
+    print("  [telegram] Removed hook scripts + disabled poller.")
+
+
+# Plugin-specific post-enable/disable hooks (keyed by plugin name)
+_PLUGIN_POST_ENABLE = {"telegram": _post_enable_telegram}
+_PLUGIN_POST_DISABLE = {"telegram": _post_disable_telegram}
+
+
 def cmd_add_plugin(args: argparse.Namespace) -> None:
     """Enable a plugin by name."""
     state_dir = _default_state_dir()
@@ -557,6 +622,11 @@ def cmd_add_plugin(args: argparse.Namespace) -> None:
         print(f"  Config: {toml_path}")
         print(f"  Edit {toml_path} to configure credentials/settings.")
         print("  The proxy will hot-reload the plugin automatically.")
+
+        # Run plugin-specific post-enable setup
+        post_enable = _PLUGIN_POST_ENABLE.get(args.name)
+        if post_enable:
+            post_enable(state_dir, project_dir)
     except FileNotFoundError as e:
         print(f"[claude-proxy] Error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -566,6 +636,11 @@ def cmd_remove_plugin(args: argparse.Namespace) -> None:
     """Disable a plugin by name (does not delete files)."""
     state_dir = _default_state_dir()
     try:
+        # Run plugin-specific pre-disable cleanup
+        post_disable = _PLUGIN_POST_DISABLE.get(args.name)
+        if post_disable:
+            post_disable(state_dir)
+
         disable_plugin(state_dir, args.name)
         print(f"[claude-proxy] Plugin '{args.name}' disabled.")
         print("  The proxy will hot-reload the change automatically.")
