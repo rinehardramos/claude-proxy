@@ -581,6 +581,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/status":
             self._health()
+        elif self.path == "/reload":
+            self._reload()
         else:
             self._forward("GET")
 
@@ -609,6 +611,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "sideload_pending": pending,
         }).encode()
 
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # ── reload ────────────────────────────────────────────────────────────
+
+    def _reload(self):
+        """Trigger a zero-downtime plugin hot-reload."""
+        if self.plugin_manager:
+            self.plugin_manager.check_and_reload()
+        body = json.dumps({"status": "reloaded"}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -858,13 +873,34 @@ def _inactivity_watchdog(server) -> None:
 
 # ── Entry point ────────────────────────────────────────────────────────────
 
+def _cmd_reload(port: int) -> None:
+    """Send a reload request to a running proxy instance."""
+    import http.client
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/reload")
+        resp = conn.getresponse()
+        data = json.loads(resp.read())
+        conn.close()
+        print(f"[proxy] {data.get('status', 'ok')}", flush=True)
+    except Exception as exc:
+        print(f"[proxy] reload failed — is the proxy running on port {port}? ({exc})", file=sys.stderr)
+        sys.exit(1)
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(prog="claude-proxy")
     parser.add_argument("--daemon", action="store_true", help="Run in background")
     parser.add_argument("--port", type=int, default=LISTEN_PORT)
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("reload", help="Hot-reload plugins on a running proxy")
     args = parser.parse_args()
     port = args.port
+
+    if args.command == "reload":
+        _cmd_reload(port)
+        return
 
     # Dedup guard — silently exit if an instance is already running.
     # Allows SessionStart hook to fire on every Claude Code window safely.

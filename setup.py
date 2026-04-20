@@ -536,6 +536,22 @@ def cmd_restart(args: argparse.Namespace) -> None:
     project_dir = _default_project_dir()
     proxy_py = project_dir / "proxy.py"
 
+    # Try hot-reload first — faster than a full restart for plugin edits.
+    if proxy_status() is not None:
+        try:
+            url = "http://127.0.0.1:18019/reload"
+            with urllib.request.urlopen(url, timeout=3) as resp:
+                result = json.loads(resp.read())
+            if result.get("status") == "reloaded":
+                print("[claude-proxy] Hot-reloaded plugins (no restart needed).")
+                status = proxy_status()
+                if status:
+                    plugins = status.get("plugins", [])
+                    print(f"  Plugins: {', '.join(plugins) if plugins else 'none'}")
+                return
+        except Exception:
+            pass  # Fall through to full restart
+
     print("[claude-proxy] Stopping proxy...")
     kill_proxy(state_dir)
     time.sleep(0.5)
