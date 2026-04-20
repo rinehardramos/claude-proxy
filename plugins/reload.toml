@@ -1,0 +1,7 @@
+enabled = true
+
+# Proxy port — must match the running proxy (default: 18019)
+# port = 18019
+
+# Trigger prefix. Prefix any message with this string to reload plugins.
+# trigger = "!reload"
