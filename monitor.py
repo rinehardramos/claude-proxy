@@ -145,6 +145,8 @@ class ResourceMonitor:
         self._last_recycle_reason = reason
 
     def start(self, on_recycle: Callable[[Breach], None], interval_s: float = 60.0) -> None:
+        if hasattr(self, "_stop_event") and not self._stop_event.is_set():
+            raise RuntimeError("ResourceMonitor is already running; call stop() first")
         self._stop_event = threading.Event()
 
         def loop():

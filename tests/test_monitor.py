@@ -1,5 +1,7 @@
 import threading
 
+import pytest
+
 from monitor import collect_metrics, evaluate_thresholds, Thresholds, ResourceMonitor, Breach
 
 
@@ -147,3 +149,17 @@ def test_monitor_watch_invokes_on_recycle_callback():
     assert done.wait(timeout=2.0), "on_recycle was not invoked within 2s"
     mon.stop()
     assert called[0].reason == "rss_exceeded"
+
+
+def test_monitor_double_start_raises():
+    mon = ResourceMonitor(
+        thresholds=Thresholds(),
+        get_reload_count=lambda: 0,
+        metrics_source=lambda: {"rss_mb": 1, "threads": 1, "fds": 1, "fd_limit": 1024},
+    )
+    mon.start(on_recycle=lambda b: None, interval_s=60.0)
+    try:
+        with pytest.raises(RuntimeError, match="already running"):
+            mon.start(on_recycle=lambda b: None, interval_s=60.0)
+    finally:
+        mon.stop()
