@@ -332,7 +332,7 @@ class TestPatchShellProfile(unittest.TestCase):
         text = self.profile.read_text()
         # The export line must follow a health check, not be unconditional
         export_pos = text.find("export ANTHROPIC_BASE_URL")
-        curl_pos = text.find("proxy-status")
+        curl_pos = text.find("/status")
         self.assertGreater(export_pos, 0)
         self.assertGreater(curl_pos, 0)
         self.assertLess(curl_pos, export_pos)  # health check comes before export

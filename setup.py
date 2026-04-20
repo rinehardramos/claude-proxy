@@ -44,7 +44,7 @@ HOOK_MARKER = "claude-proxy"
 SESSION_START_HOOK_COMMAND = "python3 {proxy_py} --daemon 2>/dev/null || true  # {marker}"
 
 # Shell profile block template.
-# Starts the proxy, then polls /proxy-status for up to 1.5 s.
+# Starts the proxy, then polls /status for up to 1.5 s.
 # ANTHROPIC_BASE_URL is only exported when the proxy is confirmed healthy --
 # if the proxy fails to start, the variable is left unset and Claude Code
 # talks directly to api.anthropic.com (graceful fallback).
@@ -53,7 +53,7 @@ _SHELL_BLOCK_TEMPLATE = """\
 # {marker} -- route Claude Code through local proxy
 python3 {proxy_py} --daemon 2>/dev/null
 _cp=0; while [ "$_cp" -lt 5 ]; do
-  curl -sf http://127.0.0.1:18019/proxy-status >/dev/null 2>&1 \\
+  curl -sf http://127.0.0.1:18019/status >/dev/null 2>&1 \\
     && export ANTHROPIC_BASE_URL=http://127.0.0.1:18019 && break
   sleep 0.3; _cp=$((_cp+1))
 done; unset _cp
@@ -383,7 +383,7 @@ def list_plugins(state_dir: Path) -> list[tuple[str, bool]]:
 def proxy_status(port: int = 18019) -> dict | None:
     """Query the proxy health endpoint. Returns parsed JSON or None."""
     try:
-        url = f"http://127.0.0.1:{port}/proxy-status"
+        url = f"http://127.0.0.1:{port}/status"
         with urllib.request.urlopen(url, timeout=2) as resp:
             return json.loads(resp.read())
     except Exception:
@@ -430,7 +430,7 @@ def install(
 Next steps:
   1. Reload your shell:   source {profile}
   2. Restart Claude Code -- the proxy will start automatically.
-  3. Verify:              curl -s http://127.0.0.1:18019/proxy-status
+  3. Verify:              curl -s http://127.0.0.1:18019/status
 
 To enable Telegram notifications:
   python3 setup.py add-plugin telegram

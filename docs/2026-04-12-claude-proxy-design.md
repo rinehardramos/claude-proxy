@@ -213,7 +213,7 @@ Stdlib-only HTTP proxy based on the same pattern as leak-guard's proxy.py.
 **Components:**
 - `ThreadedHTTPServer` — threaded request handling
 - `ProxyHandler` — request forwarding with plugin/sideload orchestration
-- Health endpoint: `GET /proxy-status` → `{"status": "ok", "plugins": [...], "sideload_pending": N}`
+- Health endpoint: `GET /status` → `{"status": "ok", "plugins": [...], "sideload_pending": N}`
 - Daemon mode: `--daemon` flag, PID file at `~/.claude/claude-proxy/proxy.pid`
 - Inactivity auto-exit: 4 hours
 - SIGTERM handler for clean shutdown
