@@ -440,47 +440,6 @@ class TestRouting(unittest.TestCase):
         h._forward.assert_called_once_with("POST")
 
 
-# ── Inactivity watchdog ───────────────────────────────────────────────────
-
-class TestInactivityWatchdog(unittest.TestCase):
-    def test_shuts_down_after_inactivity(self):
-        """Watchdog should call server.shutdown() + _cleanup_pid when idle."""
-        mock_server = MagicMock()
-        original = _proxy_mod._last_activity
-        _proxy_mod._last_activity = time.time() - 99999
-
-        with _TmpPidDir() as ctx:
-            _write_pid(os.getpid())
-            with patch.object(_proxy_mod, "_INACTIVITY_TIMEOUT", 0), \
-                 patch("time.sleep"):
-                _proxy_mod._inactivity_watchdog(mock_server, my_pid=os.getpid())
-            mock_server.shutdown.assert_called_once()
-
-        _proxy_mod._last_activity = original
-
-    def test_does_not_shut_down_when_active(self):
-        """Watchdog should loop when there's recent activity."""
-        mock_server = MagicMock()
-        _proxy_mod._last_activity = time.time()
-
-        call_count = 0
-
-        def fake_sleep(duration):
-            nonlocal call_count
-            call_count += 1
-            if call_count >= 3:
-                raise KeyboardInterrupt  # break the loop
-
-        with patch.object(_proxy_mod, "_INACTIVITY_TIMEOUT", 9999), \
-             patch("time.sleep", side_effect=fake_sleep):
-            try:
-                _proxy_mod._inactivity_watchdog(mock_server)
-            except KeyboardInterrupt:
-                pass
-
-        mock_server.shutdown.assert_not_called()
-
-
 # ── ThreadedHTTPServer properties ─────────────────────────────────────────
 
 class TestThreadedHTTPServer(unittest.TestCase):
@@ -763,13 +722,6 @@ class TestForwardPluginManagerInteraction(unittest.TestCase):
         h = self._make_handler(plugin_manager=None)
         h._forward_inner = MagicMock()
         h._forward("POST")  # should not raise
-
-    def test_forward_updates_last_activity(self):
-        before = _proxy_mod._last_activity
-        h = self._make_handler(plugin_manager=None)
-        h._forward_inner = MagicMock()
-        h._forward("POST")
-        self.assertGreaterEqual(_proxy_mod._last_activity, before)
 
 
 # ── setup.py cmd_restart ──────────────────────────────────────────────────
@@ -1068,6 +1020,31 @@ def test_plugin_manager_deferred_swap_increments_reload_count(tmp_path):
     mgr.exit_request()
     assert mgr.reload_count == 1, "swap must be applied after the last request exits"
     assert mgr._pending_plugins is None, "pending swap must be cleared after apply"
+
+
+# ── Inactivity watchdog removal regression ────────────────────────────────
+
+def test_inactivity_watchdog_symbols_removed():
+    """The inactivity watchdog has been removed — supervisor owns lifecycle now."""
+    import proxy
+    assert not hasattr(proxy, "_inactivity_watchdog")
+    assert not hasattr(proxy, "_INACTIVITY_TIMEOUT")
+    assert not hasattr(proxy, "_last_activity")
+
+
+# ── Daemonize gating under supervisor ─────────────────────────────────────
+
+def test_proxy_skips_daemon_fork_when_supervised(monkeypatch):
+    monkeypatch.setenv("CLAUDE_PROXY_SUPERVISED", "1")
+    import proxy
+    assert proxy._should_daemonize(True) is False
+
+
+def test_proxy_daemonizes_when_not_supervised(monkeypatch):
+    monkeypatch.delenv("CLAUDE_PROXY_SUPERVISED", raising=False)
+    import proxy
+    assert proxy._should_daemonize(True) is True
+    assert proxy._should_daemonize(False) is False
 
 
 if __name__ == "__main__":

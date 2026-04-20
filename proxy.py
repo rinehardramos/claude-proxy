@@ -41,7 +41,6 @@ SIDELOAD_INBOUND = SIDELOAD_DIR / "inbound"
 PID_FILE = STATE_DIR / "proxy.pid"
 LOG_FILE = STATE_DIR / "proxy.log"
 _SIDELOAD_TTL = 300        # discard sideload files older than 5 minutes
-_INACTIVITY_TIMEOUT = 4 * 3600  # auto-exit after 4 hours idle
 
 
 # ── Minimal TOML subset parser ─────────────────────────────────────────────
@@ -550,11 +549,6 @@ def process_sse_stream(
             current_event_type = None
 
 
-# ── Runtime state ──────────────────────────────────────────────────────────
-
-_last_activity = time.time()
-
-
 # ── HTTP server ────────────────────────────────────────────────────────────
 
 class ThreadedHTTPServer(http.server.HTTPServer):
@@ -688,9 +682,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     # ── proxy core ────────────────────────────────────────────────────────
 
     def _forward(self, method: str):
-        global _last_activity
-        _last_activity = time.time()
-
         if self.plugin_manager:
             self.plugin_manager.enter_request()
         try:
@@ -967,18 +958,6 @@ def is_proxy_running() -> bool:
     return False
 
 
-# ── Inactivity watchdog ────────────────────────────────────────────────────
-
-def _inactivity_watchdog(server, my_pid: int | None = None) -> None:
-    while True:
-        time.sleep(60)
-        if time.time() - _last_activity > _INACTIVITY_TIMEOUT:
-            print("[proxy] shutting down: inactivity timeout", file=sys.stderr, flush=True)
-            _cleanup_pid(expected_pid=my_pid)
-            server.shutdown()
-            break
-
-
 # ── Entry point ────────────────────────────────────────────────────────────
 
 def _acquire_startup_lock() -> "int | None":
@@ -1097,6 +1076,13 @@ def _dispatch_hook(event: str) -> None:
     sys.exit(0)
 
 
+def _should_daemonize(daemon_flag: bool) -> bool:
+    """Under a supervisor, never self-daemonize — supervisor owns the lifecycle."""
+    if os.environ.get("CLAUDE_PROXY_SUPERVISED") == "1":
+        return False
+    return daemon_flag
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(prog="claude-proxy")
@@ -1121,7 +1107,7 @@ def main():
     if is_proxy_running():
         sys.exit(0)
 
-    if args.daemon:
+    if _should_daemonize(args.daemon):
         pid = os.fork()
         if pid > 0:
             print(f"[proxy] started in background (PID {pid})", flush=True)
@@ -1192,9 +1178,6 @@ def main():
 
     server = ThreadedHTTPServer(("127.0.0.1", port), ProxyHandler)
     print(f"[proxy] listening on http://127.0.0.1:{port}", file=sys.stderr, flush=True)
-
-    wd = threading.Thread(target=_inactivity_watchdog, args=(server, my_pid), daemon=True)
-    wd.start()
 
     def _shutdown(signum, frame):
         _cleanup_pid(expected_pid=my_pid)
