@@ -181,6 +181,7 @@ class PluginManager:
         self._in_flight: int = 0
         self._pending_plugins: list | None = None
         self._pending_since: float | None = None
+        self._reload_count: int = 0
         self._lock = threading.Lock()
 
     # ── Public API ────────────────────────────────────────────────────────
@@ -192,6 +193,10 @@ class PluginManager:
     @property
     def has_pending_swap(self) -> bool:
         return self._pending_plugins is not None
+
+    @property
+    def reload_count(self) -> int:
+        return self._reload_count
 
     def enter_request(self) -> None:
         """Call at the start of each proxied request."""
@@ -235,6 +240,7 @@ class PluginManager:
                 self._plugins = new_plugins
                 self._pending_plugins = None
                 self._pending_since = None
+                self._reload_count += 1
             else:
                 self._pending_plugins = new_plugins
                 self._pending_since = time.time()
@@ -248,6 +254,7 @@ class PluginManager:
             self._plugins = self._pending_plugins
             self._pending_plugins = None
             self._pending_since = None
+            self._reload_count += 1
             print("[proxy] plugin hot-reload applied", file=sys.stderr, flush=True)
 
     def _watch_loop(self) -> None:

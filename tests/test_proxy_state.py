@@ -1025,5 +1025,27 @@ class TestServerBindAndRespond(unittest.TestCase):
         server2.server_close()
 
 
+def test_plugin_manager_tracks_reload_count(tmp_path):
+    from proxy import PluginManager
+
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    (plugins_dir / "dummy.py").write_text(
+        "def plugin_info():\n    return {'name': 'dummy', 'version': '0'}\n"
+    )
+
+    mgr = PluginManager(plugins_dir=plugins_dir, global_config_path=tmp_path / "plugins.toml")
+    mgr.initial_load()
+    assert mgr.reload_count == 0
+
+    # Touch the file so mtime changes
+    import time, os
+    time.sleep(0.01)
+    os.utime(plugins_dir / "dummy.py", None)
+
+    mgr.check_and_reload()
+    assert mgr.reload_count == 1
+
+
 if __name__ == "__main__":
     unittest.main()
