@@ -1134,5 +1134,29 @@ class TestHandleTextMessage(unittest.TestCase):
         self.assertEqual(self.t._approval_mode, "ask")
 
 
+def test_telegram_on_monitor_recycle_formats_message(monkeypatch):
+    import plugins.telegram as tg
+    sent = []
+    monkeypatch.setattr(tg, "_send_message", lambda text, **kw: sent.append(text))
+    tg.configure({"bot_token": "x", "chat_id": "y", "notify_on_recycle": True})
+
+    tg.on_monitor_recycle("rss_exceeded", 614, 512)
+    assert sent, "no telegram message was sent"
+    assert "recycl" in sent[0].lower()
+    assert "rss_exceeded" in sent[0] or "rss" in sent[0].lower()
+    assert "614" in sent[0]
+    assert "512" in sent[0]
+
+
+def test_telegram_recycle_opt_out(monkeypatch):
+    import plugins.telegram as tg
+    sent = []
+    monkeypatch.setattr(tg, "_send_message", lambda text, **kw: sent.append(text))
+    tg.configure({"bot_token": "x", "chat_id": "y", "notify_on_recycle": False})
+
+    tg.on_monitor_recycle("rss_exceeded", 614, 512)
+    assert sent == []
+
+
 if __name__ == "__main__":
     unittest.main()
