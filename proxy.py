@@ -41,7 +41,6 @@ SIDELOAD_INBOUND = SIDELOAD_DIR / "inbound"
 PID_FILE = STATE_DIR / "proxy.pid"
 LOG_FILE = STATE_DIR / "proxy.log"
 _SIDELOAD_TTL = 300        # discard sideload files older than 5 minutes
-_INACTIVITY_TIMEOUT = 4 * 3600  # auto-exit after 4 hours idle
 
 
 # ── Minimal TOML subset parser ─────────────────────────────────────────────
@@ -181,6 +180,7 @@ class PluginManager:
         self._in_flight: int = 0
         self._pending_plugins: list | None = None
         self._pending_since: float | None = None
+        self._reload_count: int = 0
         self._lock = threading.Lock()
 
     # ── Public API ────────────────────────────────────────────────────────
@@ -192,6 +192,11 @@ class PluginManager:
     @property
     def has_pending_swap(self) -> bool:
         return self._pending_plugins is not None
+
+    @property
+    def reload_count(self) -> int:
+        with self._lock:
+            return self._reload_count
 
     def enter_request(self) -> None:
         """Call at the start of each proxied request."""
@@ -235,6 +240,7 @@ class PluginManager:
                 self._plugins = new_plugins
                 self._pending_plugins = None
                 self._pending_since = None
+                self._reload_count += 1
             else:
                 self._pending_plugins = new_plugins
                 self._pending_since = time.time()
@@ -248,6 +254,7 @@ class PluginManager:
             self._plugins = self._pending_plugins
             self._pending_plugins = None
             self._pending_since = None
+            self._reload_count += 1
             print("[proxy] plugin hot-reload applied", file=sys.stderr, flush=True)
 
     def _watch_loop(self) -> None:
@@ -542,11 +549,6 @@ def process_sse_stream(
             current_event_type = None
 
 
-# ── Runtime state ──────────────────────────────────────────────────────────
-
-_last_activity = time.time()
-
-
 # ── HTTP server ────────────────────────────────────────────────────────────
 
 class ThreadedHTTPServer(http.server.HTTPServer):
@@ -571,6 +573,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     plugin_manager: PluginManager | None = None  # set by main()
     plugins: list = []  # backward compat for tests without PluginManager
+    resource_monitor: "ResourceMonitor | None" = None  # set by main()
 
     def _get_plugins(self) -> list:
         if self.plugin_manager:
@@ -608,12 +611,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if d.exists():
                 pending += sum(1 for _ in d.glob("*.json"))
 
-        body = json.dumps({
+        payload = {
             "status": "ok",
+            "pid": os.getpid(),
+            "port": LISTEN_PORT,
             "plugins": plugin_names,
             "sideload_pending": pending,
-        }).encode()
+        }
+        if self.resource_monitor is not None:
+            snap = self.resource_monitor.snapshot()
+            payload.update(snap)
+            if snap["warnings"]:
+                payload["status"] = "warning"
 
+        body = json.dumps(payload).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -671,9 +682,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     # ── proxy core ────────────────────────────────────────────────────────
 
     def _forward(self, method: str):
-        global _last_activity
-        _last_activity = time.time()
-
         if self.plugin_manager:
             self.plugin_manager.enter_request()
         try:
@@ -950,18 +958,6 @@ def is_proxy_running() -> bool:
     return False
 
 
-# ── Inactivity watchdog ────────────────────────────────────────────────────
-
-def _inactivity_watchdog(server, my_pid: int | None = None) -> None:
-    while True:
-        time.sleep(60)
-        if time.time() - _last_activity > _INACTIVITY_TIMEOUT:
-            print("[proxy] shutting down: inactivity timeout", file=sys.stderr, flush=True)
-            _cleanup_pid(expected_pid=my_pid)
-            server.shutdown()
-            break
-
-
 # ── Entry point ────────────────────────────────────────────────────────────
 
 def _acquire_startup_lock() -> "int | None":
@@ -1080,6 +1076,13 @@ def _dispatch_hook(event: str) -> None:
     sys.exit(0)
 
 
+def _should_daemonize(daemon_flag: bool) -> bool:
+    """Under a supervisor, never self-daemonize — supervisor owns the lifecycle."""
+    if os.environ.get("CLAUDE_PROXY_SUPERVISED") == "1":
+        return False
+    return daemon_flag
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(prog="claude-proxy")
@@ -1104,7 +1107,7 @@ def main():
     if is_proxy_running():
         sys.exit(0)
 
-    if args.daemon:
+    if _should_daemonize(args.daemon):
         pid = os.fork()
         if pid > 0:
             print(f"[proxy] started in background (PID {pid})", flush=True)
@@ -1143,6 +1146,31 @@ def main():
     plugin_mgr.start_watcher()
     ProxyHandler.plugin_manager = plugin_mgr
 
+    # Wire resource monitor — recycles process on leak/drift thresholds.
+    from monitor import ResourceMonitor
+    resource_monitor = ResourceMonitor(
+        get_reload_count=lambda: plugin_mgr.reload_count,
+    )
+    ProxyHandler.resource_monitor = resource_monitor
+
+    def _on_recycle(breach):
+        print(
+            f"[monitor] recycling: reason={breach.reason} "
+            f"value={breach.value} threshold={breach.threshold}",
+            file=sys.stderr, flush=True,
+        )
+        # Best-effort telegram notification (Task 15 wires this).
+        for p in plugin_mgr.plugins:
+            notify = getattr(p, "on_monitor_recycle", None)
+            if callable(notify):
+                try:
+                    notify(breach.reason, breach.value, breach.threshold)
+                except Exception as exc:
+                    print(f"[monitor] telegram notify failed: {exc}", file=sys.stderr, flush=True)
+        os._exit(75)
+
+    resource_monitor.start(on_recycle=_on_recycle, interval_s=60.0)
+
     # Clean up PID file on exit — but only if it still points to us.
     # This prevents a crashing child from deleting a healthy instance's PID.
     import atexit
@@ -1150,9 +1178,6 @@ def main():
 
     server = ThreadedHTTPServer(("127.0.0.1", port), ProxyHandler)
     print(f"[proxy] listening on http://127.0.0.1:{port}", file=sys.stderr, flush=True)
-
-    wd = threading.Thread(target=_inactivity_watchdog, args=(server, my_pid), daemon=True)
-    wd.start()
 
     def _shutdown(signum, frame):
         _cleanup_pid(expected_pid=my_pid)

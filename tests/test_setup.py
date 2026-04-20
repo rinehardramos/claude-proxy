@@ -513,58 +513,73 @@ class TestUninstallFull(unittest.TestCase):
         self._uninstall()  # should not raise
 
 
-# ── install_launchagent / uninstall_launchagent ───────────────────────────
+# ── supervisor adapter delegation ────────────────────────────────────────
 
-class TestLaunchAgent(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.plist = Path(self.tmp) / "com.claude-proxy.env.plist"
 
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
+def test_install_delegates_to_supervisor_adapter(monkeypatch, tmp_path):
+    """install() must call get_adapter().install(proxy_py) instead of the old LaunchAgent helper."""
+    import setup
 
-    def test_install_creates_plist(self):
-        from setup import install_launchagent
-        with patch("setup._LAUNCHAGENT_PATH", self.plist), \
-             patch("setup.subprocess.run"), \
-             patch("setup.sys.platform", "darwin"):
-            install_launchagent()
-        self.assertTrue(self.plist.exists())
-        self.assertIn("127.0.0.1:18019", self.plist.read_text())
+    calls = []
 
-    def test_install_idempotent(self):
-        from setup import install_launchagent
-        self.plist.write_text("existing")
-        with patch("setup._LAUNCHAGENT_PATH", self.plist), \
-             patch("setup.subprocess.run") as mock_run, \
-             patch("setup.sys.platform", "darwin"):
-            install_launchagent()
-        mock_run.assert_not_called()
-        self.assertEqual(self.plist.read_text(), "existing")
+    class FakeAdapter:
+        def install(self, proxy_path):
+            calls.append(("install", proxy_path))
 
-    def test_install_noop_on_non_darwin(self):
-        from setup import install_launchagent
-        with patch("setup._LAUNCHAGENT_PATH", self.plist), \
-             patch("setup.sys.platform", "linux"):
-            install_launchagent()
-        self.assertFalse(self.plist.exists())
+    # Stub the adapter
+    monkeypatch.setattr(setup, "get_adapter", lambda: FakeAdapter())
 
-    def test_uninstall_removes_plist(self):
-        from setup import uninstall_launchagent
-        self.plist.write_text("content")
-        with patch("setup._LAUNCHAGENT_PATH", self.plist), \
-             patch("setup.subprocess.run"), \
-             patch("setup.sys.platform", "darwin"):
-            uninstall_launchagent()
-        self.assertFalse(self.plist.exists())
+    # Stub out every other side-effecty thing install() does
+    monkeypatch.setattr(setup, "write_plugins_toml", lambda p: None)
+    monkeypatch.setattr(setup, "patch_settings_json", lambda *a, **k: None)
+    monkeypatch.setattr(setup, "patch_pretooluse_hook", lambda *a, **k: None)
+    monkeypatch.setattr(setup, "patch_shell_profile", lambda *a, **k: None)
+    monkeypatch.setattr(setup, "detect_shell_profile", lambda: tmp_path / "rc")
 
-    def test_uninstall_noop_when_missing(self):
-        from setup import uninstall_launchagent
-        with patch("setup._LAUNCHAGENT_PATH", self.plist), \
-             patch("setup.subprocess.run") as mock_run, \
-             patch("setup.sys.platform", "darwin"):
-            uninstall_launchagent()
-        mock_run.assert_not_called()
+    # Set up a fake project_dir with a proxy.py
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    (project_dir / "proxy.py").write_text("# fake")
+    state_dir = tmp_path / "state"
+    settings = tmp_path / "settings.json"
+
+    setup.install(
+        project_dir=project_dir,
+        state_dir=state_dir,
+        settings_path=settings,
+        shell_profile=tmp_path / "rc",
+    )
+
+    assert calls, "adapter.install was never called"
+    assert calls[0][0] == "install"
+    assert calls[0][1].name == "proxy.py"
+
+
+def test_uninstall_delegates_to_supervisor_adapter(monkeypatch, tmp_path):
+    import setup
+
+    calls = []
+
+    class FakeAdapter:
+        def uninstall(self):
+            calls.append("uninstall")
+
+    monkeypatch.setattr(setup, "get_adapter", lambda: FakeAdapter())
+    monkeypatch.setattr(setup, "kill_proxy", lambda sd: None)
+    monkeypatch.setattr(setup, "unpatch_pretooluse_hook", lambda *a, **k: None)
+    monkeypatch.setattr(setup, "unpatch_settings_json", lambda *a, **k: None)
+    monkeypatch.setattr(setup, "unpatch_shell_profile", lambda *a, **k: None)
+    monkeypatch.setattr(setup, "detect_shell_profile", lambda: tmp_path / "rc")
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    setup.uninstall(
+        state_dir=state_dir,
+        settings_path=tmp_path / "settings.json",
+        shell_profile=tmp_path / "rc",
+    )
+
+    assert calls == ["uninstall"]
 
 
 # ── enable_plugin ─────────────────────────────────────────────────────────
@@ -968,6 +983,41 @@ class TestInstallCmd(unittest.TestCase):
     def test_uninstall_calls_uninstall_function(self, mock_uninstall):
         main(["uninstall"])
         mock_uninstall.assert_called_once()
+
+
+def test_cmd_restart_uses_adapter(monkeypatch):
+    import setup
+    calls = []
+
+    class FakeAdapter:
+        def is_installed(self): return True
+        def restart(self): calls.append("restart")
+
+    monkeypatch.setattr(setup, "get_adapter", lambda: FakeAdapter())
+    # Prevent the hot-reload branch from returning early
+    monkeypatch.setattr(setup, "proxy_status", lambda: None)
+    import argparse
+    setup.cmd_restart(argparse.Namespace(force=False))
+    assert "restart" in calls
+
+
+def test_cmd_status_includes_monitor_metrics(monkeypatch, capsys):
+    import setup
+    monkeypatch.setattr(setup, "proxy_status", lambda: {
+        "status": "ok", "plugins": [], "uptime_s": 300,
+        "rss_mb": 42, "threads": 8, "fds": 14,
+        "plugin_reloads": 1, "warnings": [],
+    })
+    class FakeAdapter:
+        def is_installed(self): return True
+        def status(self): return {"loaded": True, "running": True, "pid": 123, "last_exit": 0}
+    monkeypatch.setattr(setup, "get_adapter", lambda: FakeAdapter())
+
+    import argparse
+    setup.cmd_status(argparse.Namespace())
+    out = capsys.readouterr().out
+    assert "rss" in out.lower()
+    assert "uptime" in out.lower() or "300" in out
 
 
 if __name__ == "__main__":

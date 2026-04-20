@@ -24,6 +24,7 @@ from pathlib import Path
 _bot_token: str | None = None
 _chat_id: str | None = None
 _project_name: str = ""
+_notify_on_recycle: bool = True
 _audio_threshold: int = 8192
 _tts_engine: str = "say"
 _tts_openai_model: str = "tts-1"
@@ -239,6 +240,7 @@ def configure(config: dict) -> None:
     global _bot_token, _chat_id, _project_name
     global _audio_threshold, _tts_engine, _voice_upload_timeout
     global _tts_openai_model, _tts_openai_voice, _tts_openai_api_key
+    global _notify_on_recycle
 
     _project_name = config.get("project_name", "")  # explicit override only; dynamic cwd used at runtime
     _audio_threshold = int(config.get("audio_threshold", 8192))
@@ -250,6 +252,8 @@ def configure(config: dict) -> None:
     _tts_openai_voice = config.get("tts_openai_voice", "alloy")
     api_key_env = config.get("tts_openai_api_key_env", "OPENAI_API_KEY")
     _tts_openai_api_key = config.get("tts_openai_api_key") or os.environ.get(api_key_env)
+
+    _notify_on_recycle = bool(config.get("notify_on_recycle", True))
 
     # Credentials
     _bot_token = config.get("bot_token")
@@ -649,6 +653,27 @@ def _send_text(token: str, chat_id: str, text: str, reply_to: int | None = None)
         urllib.request.urlopen(req, timeout=10)
     except Exception:
         pass
+
+
+def _send_message(text: str, **kwargs) -> None:
+    """Best-effort text send using the module's bot credentials."""
+    if not _bot_token or not _chat_id:
+        return
+    _send_text(_bot_token, _chat_id, text)
+
+
+def on_monitor_recycle(reason: str, value: int, threshold: int) -> None:
+    """Called by ResourceMonitor right before the proxy recycles."""
+    if not _notify_on_recycle:
+        return
+    msg = (
+        f"\u26A0 claude-proxy recycling: {reason} "
+        f"(value={value}, threshold={threshold}) \u2014 restarted cleanly"
+    )
+    try:
+        _send_message(msg)
+    except Exception:
+        pass  # best-effort; must not block recycle
 
 
 def _handle_text_message(msg: dict, token: str, chat_id: str) -> None:

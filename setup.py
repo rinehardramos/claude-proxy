@@ -38,6 +38,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+from supervisor import get_adapter
+
 # ── Constants ──────────────────────────────────────────────────────────────
 
 HOOK_MARKER = "claude-proxy"
@@ -258,76 +260,6 @@ def kill_proxy(state_dir: Path) -> None:
         pass
 
 
-_LAUNCHAGENT_LABEL = "com.claude-proxy.env"
-_LAUNCHAGENT_PATH = Path.home() / "Library" / "LaunchAgents" / f"{_LAUNCHAGENT_LABEL}.plist"
-_LAUNCHAGENT_PLIST = """\
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/launchctl</string>
-        <string>setenv</string>
-        <string>ANTHROPIC_BASE_URL</string>
-        <string>http://127.0.0.1:18019</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-</dict>
-</plist>
-"""
-
-
-def install_launchagent() -> None:
-    """Install a LaunchAgent that sets ANTHROPIC_BASE_URL system-wide at login.
-
-    This ensures GUI apps (Claude Code) always route through the proxy,
-    even when they don't inherit shell environment variables.
-    Idempotent -- does nothing if already installed.
-    """
-    if sys.platform != "darwin":
-        return
-    if _LAUNCHAGENT_PATH.exists():
-        return
-    _LAUNCHAGENT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _LAUNCHAGENT_PATH.write_text(
-        _LAUNCHAGENT_PLIST.format(label=_LAUNCHAGENT_LABEL), encoding="utf-8"
-    )
-    try:
-        subprocess.run(
-            ["launchctl", "load", str(_LAUNCHAGENT_PATH)],
-            check=False, capture_output=True,
-        )
-        subprocess.run(
-            ["launchctl", "setenv", "ANTHROPIC_BASE_URL", "http://127.0.0.1:18019"],
-            check=False, capture_output=True,
-        )
-    except FileNotFoundError:
-        pass  # launchctl not available
-
-
-def uninstall_launchagent() -> None:
-    """Remove the claude-proxy LaunchAgent -- idempotent."""
-    if sys.platform != "darwin":
-        return
-    if not _LAUNCHAGENT_PATH.exists():
-        return
-    try:
-        subprocess.run(
-            ["launchctl", "unload", str(_LAUNCHAGENT_PATH)],
-            check=False, capture_output=True,
-        )
-    except FileNotFoundError:
-        pass
-    try:
-        _LAUNCHAGENT_PATH.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-
 def _set_toml_enabled(text: str, enabled: bool) -> str:
     """Set or update the ``enabled`` flag in a TOML string."""
     val = "true" if enabled else "false"
@@ -538,8 +470,9 @@ def install(
     print(f"[claude-proxy] Patching {shell_profile}...")
     patch_shell_profile(shell_profile, proxy_py)
 
-    print("[claude-proxy] Installing LaunchAgent (ANTHROPIC_BASE_URL for GUI apps)...")
-    install_launchagent()
+    print("[claude-proxy] Installing supervisor (launchd/systemd)...")
+    adapter = get_adapter()
+    adapter.install(proxy_py)
 
     print("""
 [claude-proxy] Installation complete.
@@ -579,8 +512,11 @@ def uninstall(
     print(f"[claude-proxy] Removing shell profile block from {shell_profile}...")
     unpatch_shell_profile(shell_profile)
 
-    print("[claude-proxy] Removing LaunchAgent...")
-    uninstall_launchagent()
+    print("[claude-proxy] Removing supervisor...")
+    try:
+        get_adapter().uninstall()
+    except Exception as exc:
+        print(f"[claude-proxy] supervisor uninstall warning: {exc}", file=sys.stderr)
 
     print(f"\n[claude-proxy] Uninstalled. Reload your shell:  source {shell_profile}")
 
@@ -687,13 +623,16 @@ def cmd_list_plugins(args: argparse.Namespace) -> None:
 
 
 def cmd_restart(args: argparse.Namespace) -> None:
-    """Kill running proxy and start a fresh one."""
-    state_dir = _default_state_dir()
-    project_dir = _default_project_dir()
-    proxy_py = project_dir / "proxy.py"
+    """Restart the proxy.
 
-    # Try hot-reload first — faster than a full restart for plugin edits.
-    if proxy_status() is not None:
+    Prefer hot-reload for plugin edits. If a supervisor is installed, delegate
+    the full restart to it; otherwise fall back to the legacy kill+spawn path.
+    """
+    adapter = get_adapter()
+    force = getattr(args, "force", False)
+
+    # Hot-reload first — regardless of supervisor, if the proxy is responsive.
+    if proxy_status() is not None and not force:
         try:
             url = "http://127.0.0.1:18019/reload"
             with urllib.request.urlopen(url, timeout=3) as resp:
@@ -706,12 +645,21 @@ def cmd_restart(args: argparse.Namespace) -> None:
                     print(f"  Plugins: {', '.join(plugins) if plugins else 'none'}")
                 return
         except Exception:
-            pass  # Fall through to full restart
+            pass  # Fall through
 
+    if adapter.is_installed() and not force:
+        print("[claude-proxy] Restarting via supervisor...")
+        adapter.restart()
+        print("[claude-proxy] Restart requested.")
+        return
+
+    # Legacy fallback path — no supervisor, or --force
+    state_dir = _default_state_dir()
+    project_dir = _default_project_dir()
+    proxy_py = project_dir / "proxy.py"
     print("[claude-proxy] Stopping proxy...")
     kill_proxy(state_dir)
 
-    # Wait for port to be freed
     for _ in range(20):
         time.sleep(0.25)
         import socket
@@ -724,7 +672,6 @@ def cmd_restart(args: argparse.Namespace) -> None:
         stdout=subprocess.DEVNULL,
         stderr=open(state_dir / "proxy.log", "a"),
     )
-    # Wait for health check
     for _ in range(10):
         time.sleep(0.3)
         if proxy_status() is not None:
@@ -742,16 +689,41 @@ def cmd_restart(args: argparse.Namespace) -> None:
 
 
 def cmd_status(args: argparse.Namespace) -> None:
-    """Show proxy health status."""
+    """Show proxy + supervisor health."""
+    adapter = get_adapter()
+    sup_status = adapter.status() if adapter.is_installed() else None
     result = proxy_status()
+
     if result is None:
         print("[claude-proxy] Proxy is not running.")
+        if sup_status:
+            print(
+                f"  Supervisor: loaded={sup_status['loaded']} "
+                f"running={sup_status['running']} "
+                f"last_exit={sup_status.get('last_exit')}"
+            )
         sys.exit(1)
+
     print("[claude-proxy] Proxy is running.")
     print(f"  Status:    {result.get('status', 'unknown')}")
-    plugins = result.get("plugins", [])
+    plugins = result.get("plugins", []) or []
     print(f"  Plugins:   {', '.join(plugins) if plugins else 'none'}")
+    if "uptime_s" in result:
+        print(f"  Uptime:    {result['uptime_s']}s")
+        print(f"  RSS:       {result.get('rss_mb', '?')} MB")
+        print(f"  Threads:   {result.get('threads', '?')}")
+        print(f"  FDs:       {result.get('fds', '?')}")
+        print(f"  Reloads:   {result.get('plugin_reloads', 0)}")
+        warnings = result.get("warnings", []) or []
+        if warnings:
+            print("  Warnings:")
+            for w in warnings:
+                print(f"    - {w}")
+        else:
+            print("  Warnings:  none")
     print(f"  Sideload:  {result.get('sideload_pending', 0)} pending")
+    if sup_status:
+        print(f"  Supervisor: pid={sup_status.get('pid')} loaded={sup_status.get('loaded')}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -772,7 +744,9 @@ def build_parser() -> argparse.ArgumentParser:
     rm_p.add_argument("name", help="Plugin name (e.g. telegram)")
 
     sub.add_parser("list-plugins", help="Show installed plugins and status")
-    sub.add_parser("restart", help="Kill and restart the proxy")
+    restart_p = sub.add_parser("restart", help="Kill and restart the proxy")
+    restart_p.add_argument("--force", action="store_true",
+                           help="Skip hot-reload and supervisor; kill+spawn directly")
     sub.add_parser("status", help="Show proxy health status")
 
     return parser
