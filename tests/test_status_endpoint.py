@@ -2,23 +2,15 @@ import json
 import threading
 import time
 import urllib.request
-from pathlib import Path
 
 import pytest
 
 
 @pytest.fixture
 def running_proxy(tmp_path, monkeypatch):
-    """Spin up a real proxy on a free port, shut down at teardown."""
-    import socket
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-
-    monkeypatch.setenv("CLAUDE_PROXY_PORT", str(port))
+    """Spin up a real proxy on an OS-assigned port, shut down at teardown."""
     monkeypatch.setattr("proxy.STATE_DIR", tmp_path)
     monkeypatch.setattr("proxy.PLUGINS_DIR", tmp_path / "plugins")
-    monkeypatch.setattr("proxy.LISTEN_PORT", port)
 
     import proxy
     mgr = proxy.PluginManager(plugins_dir=tmp_path / "plugins",
@@ -31,7 +23,11 @@ def running_proxy(tmp_path, monkeypatch):
         get_reload_count=lambda: mgr.reload_count,
     )
 
-    server = proxy.ThreadedHTTPServer(("127.0.0.1", port), proxy.ProxyHandler)
+    server = proxy.ThreadedHTTPServer(("127.0.0.1", 0), proxy.ProxyHandler)
+    port = server.server_address[1]
+    monkeypatch.setenv("CLAUDE_PROXY_PORT", str(port))
+    monkeypatch.setattr("proxy.LISTEN_PORT", port)
+
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     time.sleep(0.1)
@@ -49,5 +45,7 @@ def test_status_returns_monitor_snapshot(running_proxy):
     assert "threads" in body
     assert "fds" in body
     assert "plugin_reloads" in body
+    assert "last_recycle" in body
+    assert body["last_recycle"] is None
     assert "warnings" in body
     assert isinstance(body["warnings"], list)
