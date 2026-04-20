@@ -221,15 +221,37 @@ def unpatch_shell_profile(profile: Path) -> None:
 
 
 def kill_proxy(state_dir: Path) -> None:
-    """Send SIGTERM to the running proxy via its PID file, then remove the file."""
+    """Stop the running proxy via PID file. SIGTERM first, SIGKILL after 2s."""
     pid_file = state_dir / "proxy.pid"
     if not pid_file.exists():
         return
     try:
         pid = int(pid_file.read_text().strip())
+    except (ValueError, OSError):
+        pid_file.unlink(missing_ok=True)
+        return
+
+    # SIGTERM — graceful shutdown
+    try:
         os.kill(pid, signal.SIGTERM)
-    except (ValueError, ProcessLookupError, PermissionError, OSError):
-        pass
+    except (ProcessLookupError, PermissionError, OSError):
+        pid_file.unlink(missing_ok=True)
+        return
+
+    # Wait up to 2s for graceful exit
+    for _ in range(8):
+        time.sleep(0.25)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break  # Process exited
+    else:
+        # Force kill if still alive
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
     try:
         pid_file.unlink(missing_ok=True)
     except OSError:
@@ -688,7 +710,15 @@ def cmd_restart(args: argparse.Namespace) -> None:
 
     print("[claude-proxy] Stopping proxy...")
     kill_proxy(state_dir)
-    time.sleep(0.5)
+
+    # Wait for port to be freed
+    for _ in range(20):
+        time.sleep(0.25)
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(("127.0.0.1", 18019)) != 0:
+                break
+
     subprocess.Popen(
         [sys.executable, str(proxy_py), "--daemon"],
         stdout=subprocess.DEVNULL,
@@ -706,6 +736,8 @@ def cmd_restart(args: argparse.Namespace) -> None:
         print(f"  Plugins: {', '.join(plugins) if plugins else 'none'}")
     else:
         print("[claude-proxy] Proxy failed to start. Check ~/.claude/claude-proxy/proxy.log")
+        print("  Claude Code will fail until proxy is restored. Run:")
+        print(f"    python3 {proxy_py} --daemon")
         sys.exit(1)
 
 

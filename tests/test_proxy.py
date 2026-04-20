@@ -846,7 +846,9 @@ class TestMainDedup(unittest.TestCase):
         def _fake_server(*a, **kw):
             raise _StopEarly
 
-        with unittest.mock.patch.object(_proxy_mod, "is_proxy_running", return_value=False):
+        with unittest.mock.patch.object(_proxy_mod, "is_proxy_running", return_value=False), \
+             unittest.mock.patch.object(_proxy_mod, "_acquire_startup_lock", return_value=99), \
+             unittest.mock.patch.object(_proxy_mod, "_port_in_use", return_value=False):
             with unittest.mock.patch("sys.argv", ["proxy.py"]):
                 with unittest.mock.patch.object(_proxy_mod, "ThreadedHTTPServer", side_effect=_StopEarly):
                     with unittest.mock.patch.object(_proxy_mod, "_write_pid"):
