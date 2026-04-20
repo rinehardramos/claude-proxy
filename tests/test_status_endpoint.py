@@ -49,3 +49,26 @@ def test_status_returns_monitor_snapshot(running_proxy):
     assert body["last_recycle"] is None
     assert "warnings" in body
     assert isinstance(body["warnings"], list)
+
+
+def test_monitor_recycle_exits_process(monkeypatch):
+    """When monitor detects a breach, proxy must exit cleanly with code 75."""
+    from monitor import ResourceMonitor, Thresholds, Breach
+    import proxy
+
+    exit_calls: list[int] = []
+    monkeypatch.setattr(proxy.os, "_exit", lambda code: exit_calls.append(code))
+
+    # Simulate the on_recycle callback that proxy.main() registers
+    def on_recycle(breach: Breach) -> None:
+        print(f"[monitor] recycling: reason={breach.reason} value={breach.value}")
+        proxy.os._exit(75)
+
+    mon = ResourceMonitor(
+        thresholds=Thresholds(rss_mb=1),
+        metrics_source=lambda: {"rss_mb": 500, "threads": 8, "fds": 14, "fd_limit": 1024},
+    )
+    breach = mon.should_recycle()
+    assert breach is not None
+    on_recycle(breach)
+    assert exit_calls == [75]

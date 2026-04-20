@@ -1160,6 +1160,31 @@ def main():
     plugin_mgr.start_watcher()
     ProxyHandler.plugin_manager = plugin_mgr
 
+    # Wire resource monitor — recycles process on leak/drift thresholds.
+    from monitor import ResourceMonitor
+    resource_monitor = ResourceMonitor(
+        get_reload_count=lambda: plugin_mgr.reload_count,
+    )
+    ProxyHandler.resource_monitor = resource_monitor
+
+    def _on_recycle(breach):
+        print(
+            f"[monitor] recycling: reason={breach.reason} "
+            f"value={breach.value} threshold={breach.threshold}",
+            file=sys.stderr, flush=True,
+        )
+        # Best-effort telegram notification (Task 15 wires this).
+        for p in plugin_mgr.plugins:
+            notify = getattr(p, "on_monitor_recycle", None)
+            if callable(notify):
+                try:
+                    notify(breach.reason, breach.value, breach.threshold)
+                except Exception as exc:
+                    print(f"[monitor] telegram notify failed: {exc}", file=sys.stderr)
+        os._exit(75)
+
+    resource_monitor.start(on_recycle=_on_recycle, interval_s=60.0)
+
     # Clean up PID file on exit — but only if it still points to us.
     # This prevents a crashing child from deleting a healthy instance's PID.
     import atexit
