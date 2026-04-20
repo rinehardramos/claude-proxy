@@ -888,10 +888,95 @@ def _cmd_reload(port: int) -> None:
         sys.exit(1)
 
 
+def _dispatch_hook(event: str) -> None:
+    """Unified Claude Code hook dispatcher.
+
+    Registered once in settings.json as:
+        proxy.py --hook pre-tool
+
+    Reads hook input from stdin, loads enabled plugins, calls each plugin's
+    hook handler, and returns the most restrictive decision on stdout.
+    Plugins implement hook handlers as optional functions:
+        on_pre_tool_use(hook_input: dict) -> dict | None
+
+    Returns JSON on stdout per Claude Code hook protocol.
+    """
+    import subprocess
+
+    hook_input_raw = sys.stdin.read()
+    try:
+        hook_input = json.loads(hook_input_raw)
+    except (json.JSONDecodeError, ValueError):
+        # Can't parse input — let Claude Code handle it normally
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "ask",
+            "permissionDecisionReason": "proxy hook: invalid input",
+        }}))
+        sys.exit(0)
+
+    if event != "pre-tool":
+        sys.exit(0)
+
+    # Find plugin hook scripts: ~/.claude/claude-proxy/hooks/<plugin>_*.py
+    hooks_dir = STATE_DIR / "hooks"
+    if not hooks_dir.exists():
+        sys.exit(0)
+
+    # Also check which plugins are enabled and want this hook
+    # For now, discover all *_*.py scripts in hooks_dir and run them
+    decisions: list[str] = []
+    reasons: list[str] = []
+
+    for script in sorted(hooks_dir.glob("*.py")):
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(script)],
+                input=hook_input_raw,
+                capture_output=True,
+                text=True,
+                timeout=650,  # leave margin under Claude Code's 660s hook timeout
+            )
+            if proc.stdout.strip():
+                result = json.loads(proc.stdout.strip())
+                decision = (result.get("hookSpecificOutput", {})
+                            .get("permissionDecision", ""))
+                reason = (result.get("hookSpecificOutput", {})
+                          .get("permissionDecisionReason", ""))
+                if decision:
+                    decisions.append(decision)
+                if reason:
+                    reasons.append(reason)
+        except subprocess.TimeoutExpired:
+            decisions.append("ask")
+            reasons.append(f"{script.name}: timeout")
+        except Exception as exc:
+            print(f"[proxy-hook] {script.name} error: {exc}", file=sys.stderr)
+
+    if not decisions:
+        sys.exit(0)  # no plugin had an opinion — proceed normally
+
+    # Most restrictive wins: deny > ask > allow
+    if "deny" in decisions:
+        final = "deny"
+    elif "ask" in decisions:
+        final = "ask"
+    else:
+        final = "allow"
+
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": final,
+        "permissionDecisionReason": "; ".join(reasons) if reasons else "",
+    }}))
+    sys.exit(0)
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(prog="claude-proxy")
     parser.add_argument("--daemon", action="store_true", help="Run in background")
+    parser.add_argument("--hook", metavar="EVENT", help="Run as Claude Code hook dispatcher (e.g. pre-tool)")
     parser.add_argument("--port", type=int, default=LISTEN_PORT)
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("reload", help="Hot-reload plugins on a running proxy")
@@ -900,6 +985,10 @@ def main():
 
     if args.command == "reload":
         _cmd_reload(port)
+        return
+
+    if args.hook:
+        _dispatch_hook(args.hook)
         return
 
     # Dedup guard — silently exit if an instance is already running.
