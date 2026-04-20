@@ -1038,13 +1038,40 @@ def test_plugin_manager_tracks_reload_count(tmp_path):
     mgr.initial_load()
     assert mgr.reload_count == 0
 
-    # Touch the file so mtime changes
-    import time, os
-    time.sleep(0.01)
+    # Touch the file so mtime changes (os.utime advances mtime on its own)
     os.utime(plugins_dir / "dummy.py", None)
 
     mgr.check_and_reload()
     assert mgr.reload_count == 1
+
+
+def test_plugin_manager_deferred_swap_increments_reload_count(tmp_path):
+    """Deferred path: reload queued while a request is in-flight, applied on exit."""
+    from proxy import PluginManager
+
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    (plugins_dir / "dummy.py").write_text(
+        "def plugin_info():\n    return {'name': 'dummy', 'version': '0'}\n"
+    )
+
+    mgr = PluginManager(plugins_dir=plugins_dir, global_config_path=tmp_path / "plugins.toml")
+    mgr.initial_load()
+    assert mgr.reload_count == 0
+
+    # Hold a request in-flight so the reload is deferred
+    mgr.enter_request()
+
+    # Touch the file and trigger check — should queue a pending swap, not apply yet
+    os.utime(plugins_dir / "dummy.py", None)
+    mgr.check_and_reload()
+    assert mgr.reload_count == 0, "swap must not be applied while a request is in-flight"
+    assert mgr._pending_plugins is not None, "swap should be queued"
+
+    # Complete the request — pending swap must be drained automatically
+    mgr.exit_request()
+    assert mgr.reload_count == 1, "swap must be applied after the last request exits"
+    assert mgr._pending_plugins is None, "pending swap must be cleared after apply"
 
 
 if __name__ == "__main__":

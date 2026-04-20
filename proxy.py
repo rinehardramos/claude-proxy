@@ -196,7 +196,8 @@ class PluginManager:
 
     @property
     def reload_count(self) -> int:
-        return self._reload_count
+        with self._lock:
+            return self._reload_count
 
     def enter_request(self) -> None:
         """Call at the start of each proxied request."""
