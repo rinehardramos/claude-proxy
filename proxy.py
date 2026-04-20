@@ -579,7 +579,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     # ── routing ───────────────────────────────────────────────────────────
 
     def do_GET(self):
-        if self.path == "/proxy-status":
+        if self.path == "/status":
             self._health()
         else:
             self._forward("GET")
