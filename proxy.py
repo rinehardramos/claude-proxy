@@ -579,6 +579,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     plugin_manager: PluginManager | None = None  # set by main()
     plugins: list = []  # backward compat for tests without PluginManager
+    resource_monitor: "ResourceMonitor | None" = None  # set by main()
 
     def _get_plugins(self) -> list:
         if self.plugin_manager:
@@ -616,12 +617,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if d.exists():
                 pending += sum(1 for _ in d.glob("*.json"))
 
-        body = json.dumps({
+        payload = {
             "status": "ok",
+            "pid": os.getpid(),
+            "port": LISTEN_PORT,
             "plugins": plugin_names,
             "sideload_pending": pending,
-        }).encode()
+        }
+        if self.resource_monitor is not None:
+            snap = self.resource_monitor.snapshot()
+            payload.update(snap)
+            if snap["warnings"]:
+                payload["status"] = "warning"
 
+        body = json.dumps(payload).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
