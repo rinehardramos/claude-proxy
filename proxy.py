@@ -476,7 +476,7 @@ def process_sse_stream(
                           (use ``iter(resp.readline, b"")`` for real responses).
         write_fn:         Callable that writes bytes to the client.
         plugins:          Loaded plugin modules (may have on_inbound hook).
-        request_summary:  {"user_text": str, "model": str, "path": str, "cwd": str}
+        request_summary:  {"user_text": str, "model": str, "path": str}
         inbound_sideload: Pre-loaded inbound sideload text strings.
     """
     last_block_index = -1
@@ -583,8 +583,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._health()
         elif self.path == "/reload":
             self._reload()
-        elif self.path == "/test-telegram":
-            self._test_telegram()
         else:
             self._forward("GET")
 
@@ -632,41 +630,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    # ── test telegram ─────────────────────────────────────────────────────
-
-    def _test_telegram(self):
-        """Send a sample message through the telegram plugin for visual testing."""
-        sample_response = (
-            "Security scan results:\n\n"
-            "| # | Test Case | Result | Notes |\n"
-            "|---|-----------|--------|-------|\n"
-            "| 1 | SQL Injection | PASS | Inputs sanitized |\n"
-            "| 2 | XSS Reflected | PASS | Output encoded |\n"
-            "| 3 | Rate Limiting | FAIL | No limits set |\n"
-            "| 4 | Auth Bypass | PASS | Middleware OK |\n\n"
-            "Overall: 3/4 passed. Action required on rate limiting."
-        )
-        sample_request = {"user_text": "run security scan and present a report"}
-        errors = []
-        plugins = self._get_plugins()
-        for p in plugins:
-            on_inbound = getattr(p, "on_inbound", None)
-            if on_inbound:
-                try:
-                    on_inbound(sample_response, sample_request)
-                except Exception as exc:
-                    errors.append(f"{p}: {exc}")
-                    print(f"[proxy] test-telegram error: {exc}", file=sys.stderr, flush=True)
-        status = {"status": "sent", "plugins_called": len(plugins)}
-        if errors:
-            status["errors"] = errors
-        body = json.dumps(status).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
     # ── proxy core ────────────────────────────────────────────────────────
 
     def _forward(self, method: str):
@@ -696,13 +659,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             except (json.JSONDecodeError, ValueError):
                 payload = None
 
-        request_summary: dict = {"path": self.path, "model": "", "user_text": "", "cwd": ""}
+        request_summary: dict = {"path": self.path, "model": "", "user_text": ""}
         inbound_sideload: list[str] = []
 
         if payload is not None:
             request_summary["model"] = payload.get("model", "")
             request_summary["user_text"] = _extract_user_text(payload)
-            request_summary["cwd"] = _extract_cwd(payload)
 
             # Load + consume sideload files
             outbound_items = load_sideload(SIDELOAD_OUTBOUND)
@@ -824,36 +786,6 @@ def _extract_user_text(payload: dict) -> str:
     return ""
 
 
-import re
-
-_CWD_PATTERNS = [
-    re.compile(r"^\s*[-*]?\s*Primary working directory:\s*(.+?)\s*$", re.MULTILINE),
-    re.compile(r"^\s*[-*]?\s*Working directory:\s*(.+?)\s*$", re.MULTILINE),
-    re.compile(r"^\s*cwd:\s*(.+?)\s*$", re.MULTILINE),
-]
-
-
-def _extract_cwd(payload: dict) -> str:
-    """Extract the working directory from Claude Code's system prompt.
-
-    Claude Code embeds project context in the system field as:
-        - Primary working directory: /path/to/project
-    Also supports legacy formats (Working directory:, cwd:).
-    Returns the cwd path, or empty string if not found.
-    """
-    system = payload.get("system", "")
-    if isinstance(system, list):
-        parts = [b.get("text", "") for b in system if isinstance(b, dict) and b.get("type") == "text"]
-        system = "\n".join(parts)
-    if not isinstance(system, str):
-        return ""
-    for pat in _CWD_PATTERNS:
-        m = pat.search(system)
-        if m:
-            return m.group(1).strip()
-    return ""
-
-
 def _inject_non_streaming(
     resp_body: bytes,
     plugins: list,
@@ -906,81 +838,40 @@ def _read_pid() -> int | None:
         return None
 
 
-def _cleanup_pid(expected_pid: int | None = None) -> None:
-    """Remove PID file, but only if it belongs to us.
-
-    If *expected_pid* is given, the file is only deleted when its contents
-    match.  This prevents a crashing child from wiping the PID written by
-    an earlier, healthy instance.
-    """
+def _cleanup_pid() -> None:
     try:
-        if expected_pid is not None:
-            current = _read_pid()
-            if current != expected_pid:
-                return  # not ours — leave it alone
         PID_FILE.unlink(missing_ok=True)
     except Exception:
         pass
 
 
-
-
-def _port_in_use(port: int) -> bool:
-    """Check if a TCP port is already bound on localhost."""
-    import socket
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(1)
-        return s.connect_ex(("127.0.0.1", port)) == 0
-
-
 def is_proxy_running() -> bool:
     pid = _read_pid()
-    if pid is not None:
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            _cleanup_pid()
-        except PermissionError:
-            return True  # process exists but we can't signal it
-
-    # Fallback: PID file missing/stale but port is held by a previous instance
-    if _port_in_use(LISTEN_PORT):
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
         return True
-
-    return False
+    except ProcessLookupError:
+        _cleanup_pid()
+        return False
+    except PermissionError:
+        return True  # process exists but we can't signal it
 
 
 # ── Inactivity watchdog ────────────────────────────────────────────────────
 
-def _inactivity_watchdog(server, my_pid: int | None = None) -> None:
+def _inactivity_watchdog(server) -> None:
     while True:
         time.sleep(60)
         if time.time() - _last_activity > _INACTIVITY_TIMEOUT:
             print("[proxy] shutting down: inactivity timeout", file=sys.stderr, flush=True)
-            _cleanup_pid(expected_pid=my_pid)
+            _cleanup_pid()
             server.shutdown()
             break
 
 
 # ── Entry point ────────────────────────────────────────────────────────────
-
-def _acquire_startup_lock() -> "int | None":
-    """Try to acquire an exclusive startup lock via a lockfile.
-
-    Returns the fd on success, None if another process holds it.
-    Uses fcntl.flock which is automatically released on process exit / crash.
-    """
-    import fcntl
-    lock_path = STATE_DIR / "proxy.lock"
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return fd
-    except (OSError, IOError):
-        return None
-
 
 def _cmd_reload(port: int) -> None:
     """Send a reload request to a running proxy instance."""
@@ -997,107 +888,18 @@ def _cmd_reload(port: int) -> None:
         sys.exit(1)
 
 
-def _dispatch_hook(event: str) -> None:
-    """Unified Claude Code hook dispatcher.
-
-    Registered once in settings.json as:
-        proxy.py --hook pre-tool
-
-    Reads hook input from stdin, loads enabled plugins, calls each plugin's
-    hook handler, and returns the most restrictive decision on stdout.
-    Plugins implement hook handlers as optional functions:
-        on_pre_tool_use(hook_input: dict) -> dict | None
-
-    Returns JSON on stdout per Claude Code hook protocol.
-    """
-    import subprocess
-
-    hook_input_raw = sys.stdin.read()
-    try:
-        hook_input = json.loads(hook_input_raw)
-    except (json.JSONDecodeError, ValueError):
-        # Can't parse input — let Claude Code handle it normally
-        print(json.dumps({"hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "ask",
-            "permissionDecisionReason": "proxy hook: invalid input",
-        }}))
-        sys.exit(0)
-
-    if event != "pre-tool":
-        sys.exit(0)
-
-    # Find plugin hook scripts: ~/.claude/claude-proxy/hooks/<plugin>_*.py
-    hooks_dir = STATE_DIR / "hooks"
-    if not hooks_dir.exists():
-        sys.exit(0)
-
-    # Also check which plugins are enabled and want this hook
-    # For now, discover all *_*.py scripts in hooks_dir and run them
-    decisions: list[str] = []
-    reasons: list[str] = []
-
-    for script in sorted(hooks_dir.glob("*.py")):
-        try:
-            proc = subprocess.run(
-                [sys.executable, str(script)],
-                input=hook_input_raw,
-                capture_output=True,
-                text=True,
-                timeout=650,  # leave margin under Claude Code's 660s hook timeout
-            )
-            if proc.stdout.strip():
-                result = json.loads(proc.stdout.strip())
-                decision = (result.get("hookSpecificOutput", {})
-                            .get("permissionDecision", ""))
-                reason = (result.get("hookSpecificOutput", {})
-                          .get("permissionDecisionReason", ""))
-                if decision:
-                    decisions.append(decision)
-                if reason:
-                    reasons.append(reason)
-        except subprocess.TimeoutExpired:
-            decisions.append("ask")
-            reasons.append(f"{script.name}: timeout")
-        except Exception as exc:
-            print(f"[proxy-hook] {script.name} error: {exc}", file=sys.stderr)
-
-    if not decisions:
-        sys.exit(0)  # no plugin had an opinion — proceed normally
-
-    # Most restrictive wins: deny > ask > allow
-    if "deny" in decisions:
-        final = "deny"
-    elif "ask" in decisions:
-        final = "ask"
-    else:
-        final = "allow"
-
-    print(json.dumps({"hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": final,
-        "permissionDecisionReason": "; ".join(reasons) if reasons else "",
-    }}))
-    sys.exit(0)
-
-
 def main():
     import argparse
     parser = argparse.ArgumentParser(prog="claude-proxy")
+    parser.add_argument("--daemon", action="store_true", help="Run in background")
     parser.add_argument("--port", type=int, default=LISTEN_PORT)
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("reload", help="Hot-reload plugins on a running proxy")
-    parser.add_argument("--daemon", action="store_true", help="Run in background")
-    parser.add_argument("--hook", metavar="EVENT", help="Run as Claude Code hook dispatcher (e.g. pre-tool)")
     args = parser.parse_args()
     port = args.port
 
     if args.command == "reload":
         _cmd_reload(port)
-        return
-
-    if args.hook:
-        _dispatch_hook(args.hook)
         return
 
     # Dedup guard — silently exit if an instance is already running.
@@ -1108,6 +910,7 @@ def main():
     if args.daemon:
         pid = os.fork()
         if pid > 0:
+            _write_pid(pid)
             print(f"[proxy] started in background (PID {pid})", flush=True)
             sys.exit(0)
         os.setsid()
@@ -1118,55 +921,28 @@ def main():
         log_fd = os.open(str(LOG_FILE), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         os.dup2(log_fd, 2)
 
-    # Acquire exclusive startup lock — serialises concurrent launches so only
-    # one child proceeds past this point.  The lock is held for the lifetime
-    # of the process and auto-released on exit/crash (fcntl.flock).
-    lock_fd = _acquire_startup_lock()
-    if lock_fd is None:
-        sys.exit(0)  # another instance is starting or running
-
-    # Re-check after acquiring lock — the first winner may have already bound
-    # the port while we waited (LOCK_NB means we don't actually wait, but
-    # being explicit here is cheap insurance).
-    if _port_in_use(port):
-        os.close(lock_fd)
-        sys.exit(0)
-
-    # Write PID immediately so concurrent launches see us before we finish
-    # loading plugins.  The lock already prevents races, but the PID file
-    # also serves the dedup guard on future launches (after lock is released
-    # would be too late — write it now).
-    my_pid = os.getpid()
-    _write_pid(my_pid)
-
     plugin_mgr = PluginManager()
     plugin_mgr.initial_load()
     plugin_mgr.start_watcher()
     ProxyHandler.plugin_manager = plugin_mgr
 
-    # Clean up PID file on exit — but only if it still points to us.
-    # This prevents a crashing child from deleting a healthy instance's PID.
-    import atexit
-    atexit.register(_cleanup_pid, expected_pid=my_pid)
-
     server = ThreadedHTTPServer(("127.0.0.1", port), ProxyHandler)
+    _write_pid(os.getpid())
     print(f"[proxy] listening on http://127.0.0.1:{port}", file=sys.stderr, flush=True)
 
-    wd = threading.Thread(target=_inactivity_watchdog, args=(server, my_pid), daemon=True)
+    wd = threading.Thread(target=_inactivity_watchdog, args=(server,), daemon=True)
     wd.start()
 
     def _shutdown(signum, frame):
-        _cleanup_pid(expected_pid=my_pid)
-        # Call shutdown from a thread — calling it directly in a signal
-        # handler can deadlock if serve_forever() holds an internal lock.
-        threading.Thread(target=server.shutdown, daemon=True).start()
+        _cleanup_pid()
+        server.shutdown()
 
     signal.signal(signal.SIGTERM, _shutdown)
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        _cleanup_pid(expected_pid=my_pid)
+        _cleanup_pid()
         server.shutdown()
 
 
