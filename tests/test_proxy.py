@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import proxy as _proxy_mod
 from proxy import (
     _parse_plugins_toml,
+    _extract_cwd,
     load_plugin_config,
     is_plugin_enabled,
     validate_plugin,
@@ -855,3 +856,56 @@ class TestMainDedup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# ── _extract_cwd ──────────────────────────────────────────────────────────
+
+class TestExtractCwd(unittest.TestCase):
+    """Verify cwd extraction from Claude Code system prompt formats."""
+
+    REAL_SYSTEM = (
+        "# Environment\n"
+        "You have been invoked in the following environment:\n"
+        " - Primary working directory: /Users/x/Projects/project-1\n"
+        "  - Is a git repository: true\n"
+        " - Platform: darwin\n"
+        " - Shell: zsh\n"
+    )
+
+    def test_extracts_primary_working_directory(self):
+        self.assertEqual(
+            _extract_cwd({"system": self.REAL_SYSTEM}),
+            "/Users/x/Projects/project-1",
+        )
+
+    def test_extracts_from_list_system(self):
+        payload = {"system": [{"type": "text", "text": self.REAL_SYSTEM}]}
+        self.assertEqual(_extract_cwd(payload), "/Users/x/Projects/project-1")
+
+    def test_extracts_legacy_cwd_format(self):
+        self.assertEqual(
+            _extract_cwd({"system": "<env>\ncwd: /tmp/p2\n</env>"}),
+            "/tmp/p2",
+        )
+
+    def test_extracts_working_directory_format(self):
+        self.assertEqual(
+            _extract_cwd({"system": "Working directory: /home/user/proj"}),
+            "/home/user/proj",
+        )
+
+    def test_returns_empty_when_no_match(self):
+        self.assertEqual(_extract_cwd({"system": "nothing here"}), "")
+
+    def test_returns_empty_for_missing_system(self):
+        self.assertEqual(_extract_cwd({}), "")
+
+    def test_returns_empty_for_non_string_system(self):
+        self.assertEqual(_extract_cwd({"system": 42}), "")
+
+    def test_primary_wins_over_generic(self):
+        """Primary working directory pattern takes priority."""
+        mixed = (
+            "Working directory: /generic\n"
+            " - Primary working directory: /primary\n"
+        )
+        self.assertEqual(_extract_cwd({"system": mixed}), "/primary")

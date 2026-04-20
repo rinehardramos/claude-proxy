@@ -18,6 +18,7 @@ import http.server
 import importlib.util
 import json
 import os
+import re
 import signal
 import ssl
 import sys
@@ -583,6 +584,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._health()
         elif self.path == "/reload":
             self._reload()
+        elif self.path == "/test-telegram":
+            self._test_telegram()
         else:
             self._forward("GET")
 
@@ -630,6 +633,41 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # ── test telegram ─────────────────────────────────────────────────────
+
+    def _test_telegram(self):
+        """Send a sample message through the telegram plugin for visual testing."""
+        sample_response = (
+            "Security scan results:\n\n"
+            "| # | Test Case | Result | Notes |\n"
+            "|---|-----------|--------|-------|\n"
+            "| 1 | SQL Injection | PASS | Inputs sanitized |\n"
+            "| 2 | XSS Reflected | PASS | Output encoded |\n"
+            "| 3 | Rate Limiting | FAIL | No limits set |\n"
+            "| 4 | Auth Bypass | PASS | Middleware OK |\n\n"
+            "Overall: 3/4 passed. Action required on rate limiting."
+        )
+        sample_request = {"user_text": "run security scan and present a report"}
+        errors = []
+        plugins = self._get_plugins()
+        for p in plugins:
+            on_inbound = getattr(p, "on_inbound", None)
+            if on_inbound:
+                try:
+                    on_inbound(sample_response, sample_request)
+                except Exception as exc:
+                    errors.append(f"{p}: {exc}")
+                    print(f"[proxy] test-telegram error: {exc}", file=sys.stderr, flush=True)
+        status = {"status": "sent", "plugins_called": len(plugins)}
+        if errors:
+            status["errors"] = errors
+        body = json.dumps(status).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     # ── proxy core ────────────────────────────────────────────────────────
 
     def _forward(self, method: str):
@@ -659,12 +697,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             except (json.JSONDecodeError, ValueError):
                 payload = None
 
-        request_summary: dict = {"path": self.path, "model": "", "user_text": ""}
+        request_summary: dict = {"path": self.path, "model": "", "user_text": "", "cwd": ""}
         inbound_sideload: list[str] = []
 
         if payload is not None:
             request_summary["model"] = payload.get("model", "")
             request_summary["user_text"] = _extract_user_text(payload)
+            request_summary["cwd"] = _extract_cwd(payload)
 
             # Load + consume sideload files
             outbound_items = load_sideload(SIDELOAD_OUTBOUND)
@@ -783,6 +822,34 @@ def _extract_user_text(payload: dict) -> str:
                     text = block.get("text", "")
                     if not text.startswith("<system-reminder>"):
                         return text
+    return ""
+
+
+_CWD_PATTERNS = [
+    re.compile(r"^\s*[-*]?\s*Primary working directory:\s*(.+?)\s*$", re.MULTILINE),
+    re.compile(r"^\s*[-*]?\s*Working directory:\s*(.+?)\s*$", re.MULTILINE),
+    re.compile(r"^\s*cwd:\s*(.+?)\s*$", re.MULTILINE),
+]
+
+
+def _extract_cwd(payload: dict) -> str:
+    """Extract the working directory from Claude Code's system prompt.
+
+    Claude Code embeds project context in the system field as:
+        - Primary working directory: /path/to/project
+    Also supports legacy formats (Working directory:, cwd:).
+    Returns the cwd path, or empty string if not found.
+    """
+    system = payload.get("system", "")
+    if isinstance(system, list):
+        parts = [b.get("text", "") for b in system if isinstance(b, dict) and b.get("type") == "text"]
+        system = "\n".join(parts)
+    if not isinstance(system, str):
+        return ""
+    for pat in _CWD_PATTERNS:
+        m = pat.search(system)
+        if m:
+            return m.group(1).strip()
     return ""
 
 

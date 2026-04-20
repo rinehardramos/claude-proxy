@@ -127,13 +127,13 @@ class TestConfigure(unittest.TestCase):
             self.t.configure({"project_name": "my-project"})
         self.assertEqual(self.t._project_name, "my-project")
 
-    def test_project_name_defaults_to_cwd_basename(self):
+    def test_project_name_empty_when_unset(self):
         env = self._clean_env()
         env["TELEGRAM_BOT_TOKEN"] = "tok"
         env["TELEGRAM_CHAT_ID"] = "chat"
         with patch.dict(os.environ, env, clear=True):
             self.t.configure({})
-        self.assertEqual(self.t._project_name, os.path.basename(os.getcwd()))
+        self.assertEqual(self.t._project_name, "")
 
     def test_reads_audio_threshold_from_config(self):
         env = self._clean_env()
@@ -390,8 +390,8 @@ class TestSplitMessage(unittest.TestCase):
     def test_short_response_single_chunk(self):
         chunks = self.t._split_message("Hello world", "myproj", "What?")
         self.assertEqual(len(chunks), 1)
-        self.assertIn("Project: myproj", chunks[0])
-        self.assertIn('Prompt: "What?"', chunks[0])
+        self.assertIn("<b>myproj</b>", chunks[0])
+        self.assertIn("<blockquote>What?</blockquote>", chunks[0])
         self.assertIn("Hello world", chunks[0])
 
     def test_first_chunk_has_full_prompt(self):
@@ -409,15 +409,15 @@ class TestSplitMessage(unittest.TestCase):
         big = "A" * 10000
         chunks = self.t._split_message(big, "proj", "q")
         self.assertGreater(len(chunks), 1)
-        self.assertIn('Prompt: "q"', chunks[0])
+        self.assertIn("<blockquote>q</blockquote>", chunks[0])
         for i, chunk in enumerate(chunks[1:], start=2):
-            self.assertIn(f"Project: proj [{i}/{len(chunks)}]", chunk)
+            self.assertIn(f"<b>proj [{i}/{len(chunks)}]</b>", chunk)
 
     def test_subsequent_chunks_no_prompt(self):
         big = "B" * 10000
         chunks = self.t._split_message(big, "proj", "question")
         for chunk in chunks[1:]:
-            self.assertNotIn("Prompt:", chunk)
+            self.assertNotIn("<blockquote>question</blockquote>", chunk)
 
     def test_each_chunk_within_max_length(self):
         big = "C" * 15000
@@ -428,13 +428,14 @@ class TestSplitMessage(unittest.TestCase):
     def test_all_content_preserved(self):
         response = "D" * 10000
         chunks = self.t._split_message(response, "proj", "q")
+        # Extract response body from blockquote-wrapped chunks
+        import re
         combined = ""
-        for i, chunk in enumerate(chunks):
-            lines = chunk.split("\n")
-            if i == 0:
-                combined += "\n".join(lines[2:])
-            else:
-                combined += "\n".join(lines[1:])
+        for chunk in chunks:
+            # Last blockquote in each chunk contains the response body
+            matches = re.findall(r"<blockquote>(.*?)</blockquote>", chunk, re.DOTALL)
+            if matches:
+                combined += matches[-1]
         self.assertEqual(combined, response)
 
     def test_diagnostic_note_included_in_first_chunk(self):
@@ -496,8 +497,24 @@ class TestOnInbound(unittest.TestCase):
     def test_message_format_has_project_and_prompt(self):
         _, captured = self._call_and_capture("hello", {"user_text": "Say hi"})
         body = json.loads(captured[0].data.decode())
-        self.assertIn("Project:", body["text"])
-        self.assertIn('Prompt: "Say hi"', body["text"])
+        self.assertIn("<b>", body["text"])
+        self.assertIn("<blockquote>Say hi</blockquote>", body["text"])
+
+    def test_on_inbound_uses_cwd_from_request(self):
+        _, captured = self._call_and_capture(
+            "hello",
+            {"user_text": "hi", "cwd": "/some/where/project-1"},
+        )
+        body = json.loads(captured[0].data.decode())
+        self.assertIn("<b>project-1</b>", body["text"])
+
+    def test_on_inbound_shows_unknown_when_no_cwd_and_no_config(self):
+        env = {"TELEGRAM_BOT_TOKEN": "test-token", "TELEGRAM_CHAT_ID": "99999"}
+        with patch.dict(os.environ, env, clear=False):
+            self.t.configure({"tts_engine": "none"})
+        _, captured = self._call_and_capture("hello", {"user_text": "hi"})
+        body = json.loads(captured[0].data.decode())
+        self.assertIn("(unknown project)", body["text"])
 
     def test_full_prompt_not_truncated(self):
         long_prompt = "z" * 300
@@ -767,6 +784,354 @@ class TestCleanup(unittest.TestCase):
 
     def test_missing_file_no_error(self):
         self.t._cleanup("/nonexistent/path/file.ogg")
+
+
+# ── Callback poller ──────────────────────────────────────────────────────
+
+class TestCallbackPoller(unittest.TestCase):
+    """Test the Telegram callback poller functions."""
+
+    def setUp(self):
+        self.t = _load()
+        import tempfile
+        self.tmpdir = tempfile.mkdtemp()
+        self._orig_hook_dir = self.t.HOOK_DIR
+        self.t.HOOK_DIR = Path(self.tmpdir)
+        (Path(self.tmpdir) / "pending").mkdir()
+        (Path(self.tmpdir) / "decided").mkdir()
+
+    def tearDown(self):
+        self.t.HOOK_DIR = self._orig_hook_dir
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_handle_callback_approve(self):
+        """Approve callback writes decided file and removes pending."""
+        decision_id = "abc123"
+        pending = Path(self.tmpdir) / "pending" / f"{decision_id}.json"
+        decided = Path(self.tmpdir) / "decided" / f"{decision_id}.json"
+        pending.write_text(json.dumps({"message_id": 1, "created_at": 0}))
+
+        cb = {
+            "id": "qid",
+            "data": f"approve:{decision_id}",
+            "message": {"message_id": 1},
+        }
+
+        with patch.object(urllib.request, "urlopen"):
+            self.t._handle_callback(cb, "tok", "chat")
+
+        self.assertTrue(decided.exists())
+        result = json.loads(decided.read_text())
+        self.assertEqual(result["decision"], "allow")
+        self.assertFalse(pending.exists())
+
+    def test_handle_callback_deny(self):
+        """Deny callback writes 'deny' decision."""
+        decision_id = "def456"
+        pending = Path(self.tmpdir) / "pending" / f"{decision_id}.json"
+        decided = Path(self.tmpdir) / "decided" / f"{decision_id}.json"
+        pending.write_text(json.dumps({"message_id": 2, "created_at": 0}))
+
+        cb = {
+            "id": "qid2",
+            "data": f"deny:{decision_id}",
+            "message": {"message_id": 2},
+        }
+
+        with patch.object(urllib.request, "urlopen"):
+            self.t._handle_callback(cb, "tok", "chat")
+
+        self.assertTrue(decided.exists())
+        result = json.loads(decided.read_text())
+        self.assertEqual(result["decision"], "deny")
+
+    def test_handle_callback_expired_pending(self):
+        """Callback for expired/missing pending is handled gracefully."""
+        cb = {
+            "id": "qid3",
+            "data": "approve:nonexistent",
+            "message": {"message_id": 3},
+        }
+
+        with patch.object(urllib.request, "urlopen"):
+            self.t._handle_callback(cb, "tok", "chat")
+
+        decided = Path(self.tmpdir) / "decided" / "nonexistent.json"
+        self.assertFalse(decided.exists())
+
+    def test_handle_callback_invalid_format(self):
+        """Callback with no colon is ignored."""
+        cb = {"id": "qid4", "data": "invalid", "message": {"message_id": 4}}
+        self.t._handle_callback(cb, "tok", "chat")
+
+    def test_cleanup_stale_files(self):
+        """Stale files older than max_age are removed."""
+        import time as _time
+        old = Path(self.tmpdir) / "pending" / "old.json"
+        old.write_text(json.dumps({"message_id": 99}))
+        os.utime(old, (_time.time() - 700, _time.time() - 700))
+
+        fresh = Path(self.tmpdir) / "pending" / "fresh.json"
+        fresh.write_text(json.dumps({"message_id": 100}))
+
+        with patch.object(urllib.request, "urlopen"):
+            self.t._cleanup_stale_hook_files("tok", "chat", max_age=600)
+
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
+
+    def test_cleanup_expires_telegram_message(self):
+        """Stale pending files trigger Telegram message edit to expired."""
+        import time as _time
+        stale = Path(self.tmpdir) / "pending" / "stale.json"
+        stale.write_text(json.dumps({"message_id": 42}))
+        os.utime(stale, (_time.time() - 700, _time.time() - 700))
+
+        calls = []
+        def mock_urlopen(req, timeout=None):
+            calls.append(req)
+
+        with patch.object(urllib.request, "urlopen", side_effect=mock_urlopen):
+            self.t._cleanup_stale_hook_files("tok", "chat", max_age=600)
+
+        self.assertFalse(stale.exists())
+        # Should have called editMessageText to mark as expired
+        self.assertTrue(len(calls) > 0)
+        body = json.loads(calls[0].data.decode())
+        self.assertIn("Expired", body.get("reply_markup", ""))
+
+    def test_handle_callback_noop_ignored(self):
+        """Noop callback (re-tap on decided button) is handled gracefully."""
+        cb = {"id": "qid5", "data": "noop:decided", "message": {"message_id": 5}}
+        with patch.object(urllib.request, "urlopen"):
+            self.t._handle_callback(cb, "tok", "chat")
+
+    def test_poller_not_started_without_config_flag(self):
+        """Poller should not start unless approval_poller is set."""
+        env = {"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_CHAT_ID": "chat"}
+        with patch.dict(os.environ, env, clear=False):
+            self.t.configure({})
+        # _poller_thread should be None (not started)
+        self.assertTrue(
+            self.t._poller_thread is None or not self.t._poller_thread.is_alive()
+        )
+
+
+class TestExtractOptions(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+
+    def test_extracts_numbered_options_at_end(self):
+        text = "Choose one:\n1. Yes\n2. No\n3. Maybe"
+        result = self.t._extract_options(text)
+        self.assertEqual(result, ["Yes", "No", "Maybe"])
+
+    def test_returns_none_for_single_option(self):
+        text = "1. Only one"
+        self.assertIsNone(self.t._extract_options(text))
+
+    def test_returns_none_for_no_options(self):
+        text = "Just some regular text here."
+        self.assertIsNone(self.t._extract_options(text))
+
+    def test_extracts_indented_options(self):
+        text = "Pick:\n  1. Alpha\n  2. Beta"
+        result = self.t._extract_options(text)
+        self.assertEqual(result, ["Alpha", "Beta"])
+
+    def test_ignores_long_numbered_list(self):
+        """Numbered lists with 5+ items are not interactive options."""
+        text = (
+            "Summary:\n"
+            "1. First change was big\n"
+            "2. Second change was medium\n"
+            "3. Third change was small\n"
+            "4. Fourth change was tiny\n"
+            "5. Fifth change was trivial"
+        )
+        self.assertIsNone(self.t._extract_options(text))
+
+    def test_ignores_numbered_list_not_at_end(self):
+        """Numbered items buried in middle of text are not options."""
+        text = (
+            "1. Do this\n"
+            "2. Do that\n"
+            "\n"
+            "And then we continued with a long explanation about "
+            "how all of this works in detail with many more lines "
+            "of text that follow after the numbered items.\n"
+            "More text here.\n"
+            "Even more text.\n"
+            "Final paragraph."
+        )
+        self.assertIsNone(self.t._extract_options(text))
+
+    def test_ignores_long_option_labels(self):
+        """Options with very long labels (>80 chars) are not interactive."""
+        text = (
+            "1. " + "x" * 85 + "\n"
+            "2. " + "y" * 85
+        )
+        self.assertIsNone(self.t._extract_options(text))
+
+
+class TestOnOutbound(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+
+    def test_injects_pending_reply(self):
+        self.t._pending_replies.append("hello from telegram")
+        payload = {
+            "messages": [
+                {"role": "user", "content": "test prompt"},
+            ],
+        }
+        result = self.t.on_outbound(payload)
+        self.assertIsNotNone(result)
+        self.assertIn("hello from telegram", result["messages"][0]["content"])
+        self.assertIn("system-reminder", result["messages"][0]["content"])
+        # Queue should be empty after injection
+        self.assertEqual(len(self.t._pending_replies), 0)
+
+    def test_injects_into_block_list_content(self):
+        self.t._pending_replies.append("reply text")
+        payload = {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            ],
+        }
+        result = self.t.on_outbound(payload)
+        self.assertIsNotNone(result)
+        last_block = result["messages"][0]["content"][-1]
+        self.assertEqual(last_block["type"], "text")
+        self.assertIn("reply text", last_block["text"])
+
+    def test_noop_when_no_replies(self):
+        payload = {"messages": [{"role": "user", "content": "hi"}]}
+        result = self.t.on_outbound(payload)
+        self.assertIsNone(result)
+
+    def test_does_not_mutate_original(self):
+        self.t._pending_replies.append("test")
+        original_content = "original"
+        payload = {"messages": [{"role": "user", "content": original_content}]}
+        self.t.on_outbound(payload)
+        self.assertEqual(payload["messages"][0]["content"], original_content)
+
+    def test_injects_multiple_replies(self):
+        self.t._pending_replies.extend(["first", "second"])
+        payload = {"messages": [{"role": "user", "content": "prompt"}]}
+        result = self.t.on_outbound(payload)
+        self.assertIn("first", result["messages"][0]["content"])
+        self.assertIn("second", result["messages"][0]["content"])
+
+
+class TestMute(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+
+    def test_mute_suppresses_on_inbound(self):
+        env = {"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_CHAT_ID": "chat"}
+        with patch.dict(os.environ, env, clear=False):
+            self.t.configure({})
+        self.t._muted = True
+        result = self.t.on_inbound("response text", {"user_text": "hi"})
+        self.assertIsNone(result)
+
+    def test_unmuted_sends_notification(self):
+        env = {"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_CHAT_ID": "chat"}
+        with patch.dict(os.environ, env, clear=False):
+            self.t.configure({})
+        self.t._muted = False
+        with patch("urllib.request.urlopen"):
+            # Should not return None (fires notification thread)
+            result = self.t.on_inbound("response text", {"user_text": "hi"})
+            # on_inbound always returns None (fire-and-forget), but it should start a thread
+            self.assertIsNone(result)
+
+
+class TestHandleTextMessage(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+
+    def test_mute_toggle(self):
+        self.assertFalse(self.t._muted)
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "/mute"}, "tok", "chat")
+        self.assertTrue(self.t._muted)
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "/mute"}, "tok", "chat")
+        self.assertFalse(self.t._muted)
+
+    def test_mute_on_off(self):
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "/mute_on"}, "tok", "chat")
+        self.assertTrue(self.t._muted)
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "/mute_off"}, "tok", "chat")
+        self.assertFalse(self.t._muted)
+
+    def test_reply_queued_when_waiting(self):
+        self.t._waiting_for_reply = True
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "my reply"}, "tok", "chat")
+        self.assertFalse(self.t._waiting_for_reply)
+        self.assertEqual(self.t._pending_replies, ["my reply"])
+
+    def test_reply_to_bot_message_queued(self):
+        msg = {
+            "text": "comment text",
+            "reply_to_message": {"from": {"is_bot": True}},
+        }
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message(msg, "tok", "chat")
+        self.assertEqual(self.t._pending_replies, ["comment text"])
+
+    def test_mode_set_auto_approve(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self.t.HOOK_DIR = Path(tmp)
+            self.t._MODE_FILE = Path(tmp) / "mode"
+            with patch("urllib.request.urlopen"):
+                self.t._handle_text_message({"text": "/mode auto-approve"}, "tok", "chat")
+            self.assertEqual(self.t._approval_mode, "auto-approve")
+            self.assertEqual((Path(tmp) / "mode").read_text(), "auto-approve")
+
+    def test_mode_set_auto_deny(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self.t.HOOK_DIR = Path(tmp)
+            self.t._MODE_FILE = Path(tmp) / "mode"
+            with patch("urllib.request.urlopen"):
+                self.t._handle_text_message({"text": "/mode auto-deny"}, "tok", "chat")
+            self.assertEqual(self.t._approval_mode, "auto-deny")
+
+    def test_mode_set_ask(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self.t.HOOK_DIR = Path(tmp)
+            self.t._MODE_FILE = Path(tmp) / "mode"
+            self.t._approval_mode = "auto-approve"
+            with patch("urllib.request.urlopen"):
+                self.t._handle_text_message({"text": "/mode ask"}, "tok", "chat")
+            self.assertEqual(self.t._approval_mode, "ask")
+
+    def test_mode_invalid_shows_usage(self):
+        with patch("urllib.request.urlopen") as mock_url:
+            self.t._handle_text_message({"text": "/mode invalid"}, "tok", "chat")
+            # Should have been called (sends usage message)
+            self.assertTrue(mock_url.called)
+            # Mode unchanged
+            self.assertEqual(self.t._approval_mode, "ask")
+
+    def test_mode_no_arg_shows_current(self):
+        with patch("urllib.request.urlopen") as mock_url:
+            self.t._handle_text_message({"text": "/mode"}, "tok", "chat")
+            self.assertTrue(mock_url.called)
+
+    def test_mode_default_is_ask(self):
+        self.assertEqual(self.t._approval_mode, "ask")
 
 
 if __name__ == "__main__":

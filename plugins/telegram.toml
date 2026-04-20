@@ -25,3 +25,12 @@ chat_id   = "-5123265276"
 # tts_openai_model = "tts-1"
 # tts_openai_voice = "alloy"
 # tts_openai_api_key_env = "OPENAI_API_KEY"
+
+# Remote approval via Telegram inline buttons.
+# Enable the callback poller that listens for Approve/Deny button presses.
+# Requires the PreToolUse hook script (hooks/telegram_approve.py).
+approval_poller = "true"
+
+# Scanner for the approval hook: "always" (ask for every tool call),
+# "leak-guard" (only when PII detected), "none" (disabled)
+approval_scanner = "always"
