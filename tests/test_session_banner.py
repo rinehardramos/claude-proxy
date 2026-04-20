@@ -27,10 +27,14 @@ def _serve(payload: dict, port_holder: list):
     return server
 
 
-def _run_banner(port: int) -> str:
+def _run_banner(port: int, home: str = "/tmp/claude-proxy-test-home-nonexistent") -> str:
     result = subprocess.run(
         ["/bin/sh", str(BANNER)],
-        env={"CLAUDE_PROXY_PORT": str(port), "PATH": "/usr/bin:/bin"},
+        env={
+            "CLAUDE_PROXY_PORT": str(port),
+            "PATH": "/usr/bin:/bin",
+            "HOME": home,
+        },
         capture_output=True, text=True, timeout=5,
     )
     return result.stdout.strip()
@@ -60,15 +64,18 @@ def test_banner_warning_status():
         out = _run_banner(ports[0])
     finally:
         server.shutdown()
-    assert "⚠" in out or "!" in out
+    assert "⚠" in out
     assert "480MB" in out
 
 
-def test_banner_dead_proxy():
-    # No server running on an unused port
+def test_banner_dead_proxy(tmp_path):
+    """Simulate an installed supervisor so the banner skips the spawn branch."""
     import socket
+    fake_plist = tmp_path / "Library" / "LaunchAgents" / "com.claude-proxy.proxy.plist"
+    fake_plist.parent.mkdir(parents=True)
+    fake_plist.write_text("fake")
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         free_port = s.getsockname()[1]
-    out = _run_banner(free_port)
-    assert "not responding" in out or "starting" in out
+    out = _run_banner(free_port, home=str(tmp_path))
+    assert "not responding" in out
