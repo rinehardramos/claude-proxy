@@ -24,6 +24,7 @@ def test_plist_contents(tmp_path, monkeypatch):
     assert data["ThrottleInterval"] == 5
     assert data["EnvironmentVariables"]["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:")
     assert data["EnvironmentVariables"]["CLAUDE_PROXY_SUPERVISED"] == "1"
+    assert "PATH" in data["EnvironmentVariables"]
     assert str(proxy_path) in data["ProgramArguments"]
 
 
