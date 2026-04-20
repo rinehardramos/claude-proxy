@@ -905,40 +905,81 @@ def _read_pid() -> int | None:
         return None
 
 
-def _cleanup_pid() -> None:
+def _cleanup_pid(expected_pid: int | None = None) -> None:
+    """Remove PID file, but only if it belongs to us.
+
+    If *expected_pid* is given, the file is only deleted when its contents
+    match.  This prevents a crashing child from wiping the PID written by
+    an earlier, healthy instance.
+    """
     try:
+        if expected_pid is not None:
+            current = _read_pid()
+            if current != expected_pid:
+                return  # not ours — leave it alone
         PID_FILE.unlink(missing_ok=True)
     except Exception:
         pass
 
 
+
+
+def _port_in_use(port: int) -> bool:
+    """Check if a TCP port is already bound on localhost."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
 def is_proxy_running() -> bool:
     pid = _read_pid()
-    if pid is None:
-        return False
-    try:
-        os.kill(pid, 0)
+    if pid is not None:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            _cleanup_pid()
+        except PermissionError:
+            return True  # process exists but we can't signal it
+
+    # Fallback: PID file missing/stale but port is held by a previous instance
+    if _port_in_use(LISTEN_PORT):
         return True
-    except ProcessLookupError:
-        _cleanup_pid()
-        return False
-    except PermissionError:
-        return True  # process exists but we can't signal it
+
+    return False
 
 
 # ── Inactivity watchdog ────────────────────────────────────────────────────
 
-def _inactivity_watchdog(server) -> None:
+def _inactivity_watchdog(server, my_pid: int | None = None) -> None:
     while True:
         time.sleep(60)
         if time.time() - _last_activity > _INACTIVITY_TIMEOUT:
             print("[proxy] shutting down: inactivity timeout", file=sys.stderr, flush=True)
-            _cleanup_pid()
+            _cleanup_pid(expected_pid=my_pid)
             server.shutdown()
             break
 
 
 # ── Entry point ────────────────────────────────────────────────────────────
+
+def _acquire_startup_lock() -> "int | None":
+    """Try to acquire an exclusive startup lock via a lockfile.
+
+    Returns the fd on success, None if another process holds it.
+    Uses fcntl.flock which is automatically released on process exit / crash.
+    """
+    import fcntl
+    lock_path = STATE_DIR / "proxy.lock"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except (OSError, IOError):
+        return None
+
 
 def _cmd_reload(port: int) -> None:
     """Send a reload request to a running proxy instance."""
@@ -1066,7 +1107,6 @@ def main():
     if args.daemon:
         pid = os.fork()
         if pid > 0:
-            _write_pid(pid)
             print(f"[proxy] started in background (PID {pid})", flush=True)
             sys.exit(0)
         os.setsid()
@@ -1077,28 +1117,55 @@ def main():
         log_fd = os.open(str(LOG_FILE), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         os.dup2(log_fd, 2)
 
+    # Acquire exclusive startup lock — serialises concurrent launches so only
+    # one child proceeds past this point.  The lock is held for the lifetime
+    # of the process and auto-released on exit/crash (fcntl.flock).
+    lock_fd = _acquire_startup_lock()
+    if lock_fd is None:
+        sys.exit(0)  # another instance is starting or running
+
+    # Re-check after acquiring lock — the first winner may have already bound
+    # the port while we waited (LOCK_NB means we don't actually wait, but
+    # being explicit here is cheap insurance).
+    if _port_in_use(port):
+        os.close(lock_fd)
+        sys.exit(0)
+
+    # Write PID immediately so concurrent launches see us before we finish
+    # loading plugins.  The lock already prevents races, but the PID file
+    # also serves the dedup guard on future launches (after lock is released
+    # would be too late — write it now).
+    my_pid = os.getpid()
+    _write_pid(my_pid)
+
     plugin_mgr = PluginManager()
     plugin_mgr.initial_load()
     plugin_mgr.start_watcher()
     ProxyHandler.plugin_manager = plugin_mgr
 
+    # Clean up PID file on exit — but only if it still points to us.
+    # This prevents a crashing child from deleting a healthy instance's PID.
+    import atexit
+    atexit.register(_cleanup_pid, expected_pid=my_pid)
+
     server = ThreadedHTTPServer(("127.0.0.1", port), ProxyHandler)
-    _write_pid(os.getpid())
     print(f"[proxy] listening on http://127.0.0.1:{port}", file=sys.stderr, flush=True)
 
-    wd = threading.Thread(target=_inactivity_watchdog, args=(server,), daemon=True)
+    wd = threading.Thread(target=_inactivity_watchdog, args=(server, my_pid), daemon=True)
     wd.start()
 
     def _shutdown(signum, frame):
-        _cleanup_pid()
-        server.shutdown()
+        _cleanup_pid(expected_pid=my_pid)
+        # Call shutdown from a thread — calling it directly in a signal
+        # handler can deadlock if serve_forever() holds an internal lock.
+        threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _shutdown)
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        _cleanup_pid()
+        _cleanup_pid(expected_pid=my_pid)
         server.shutdown()
 
 

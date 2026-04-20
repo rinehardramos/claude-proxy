@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from io import StringIO
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, call
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from setup import (
@@ -426,13 +426,16 @@ class TestKillProxy(unittest.TestCase):
     def test_sends_sigterm_to_pid_from_file(self):
         self._write_pid(99999)
         with patch("os.kill") as mock_kill:
-            mock_kill.side_effect = [None]  # SIGTERM succeeds
-            kill_proxy(self.state_dir)
-        mock_kill.assert_called_once_with(99999, signal.SIGTERM)
+            # SIGTERM succeeds, then kill(pid, 0) → ProcessLookupError (exited)
+            mock_kill.side_effect = [None, ProcessLookupError]
+            with patch("time.sleep"):
+                kill_proxy(self.state_dir)
+        self.assertEqual(mock_kill.call_args_list[0], call(99999, signal.SIGTERM))
 
     def test_removes_pid_file_after_kill(self):
         self._write_pid(99999)
-        with patch("os.kill"):
+        with patch("os.kill", side_effect=[None, ProcessLookupError]), \
+             patch("time.sleep"):
             kill_proxy(self.state_dir)
         self.assertFalse((self.state_dir / "proxy.pid").exists())
 
