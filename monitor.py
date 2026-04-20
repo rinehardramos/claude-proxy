@@ -9,8 +9,10 @@ import os
 import resource
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Optional
 
 try:
     import psutil as _PSUTIL
@@ -99,3 +101,78 @@ def evaluate_thresholds(metrics: dict, reload_count: int, t: Thresholds) -> Brea
     if reload_count > t.reloads:
         return Breach("reloads_exceeded", reload_count, t.reloads)
     return None
+
+
+class ResourceMonitor:
+    """Tracks proxy health metrics and decides when to recycle.
+
+    Does NOT own the recycle action itself — the owner polls should_recycle()
+    and performs the drain+exit. This keeps ResourceMonitor unit-testable
+    without a real HTTP server.
+    """
+
+    def __init__(
+        self,
+        thresholds: Thresholds = Thresholds(),
+        get_reload_count: Callable[[], int] = lambda: 0,
+        clock: Callable[[], float] = time.time,
+        metrics_source: Callable[[], dict] = collect_metrics,
+        cooldown_s: float = 600.0,
+    ):
+        self._thresholds = thresholds
+        self._get_reload_count = get_reload_count
+        self._clock = clock
+        self._metrics = metrics_source
+        self._cooldown_s = cooldown_s
+        self._started_at = clock()
+        self._last_recycle_at: Optional[float] = None
+        self._last_recycle_reason: Optional[str] = None
+
+    def _enabled(self) -> bool:
+        return os.environ.get("CLAUDE_PROXY_MONITOR", "on").lower() != "off"
+
+    def should_recycle(self) -> Optional[Breach]:
+        if not self._enabled():
+            return None
+        if self._last_recycle_at is not None:
+            if self._clock() - self._last_recycle_at < self._cooldown_s:
+                return None
+        metrics = self._metrics()
+        return evaluate_thresholds(metrics, self._get_reload_count(), self._thresholds)
+
+    def mark_recycled(self, reason: str) -> None:
+        self._last_recycle_at = self._clock()
+        self._last_recycle_reason = reason
+
+    def snapshot(self) -> dict:
+        metrics = self._metrics()
+        warnings: list[str] = []
+        # "near cap" = >=80% of threshold
+        if metrics["rss_mb"] >= self._thresholds.rss_mb * 0.8:
+            warnings.append(
+                f"rss {metrics['rss_mb']}MB near cap {self._thresholds.rss_mb}MB"
+            )
+        if metrics["threads"] >= self._thresholds.threads * 0.8:
+            warnings.append(
+                f"threads {metrics['threads']} near cap {self._thresholds.threads}"
+            )
+        fd_cap = int(metrics["fd_limit"] * self._thresholds.fd_pct)
+        if metrics["fds"] >= fd_cap * 0.8:
+            warnings.append(f"fds {metrics['fds']} near cap {fd_cap}")
+
+        last: Optional[dict] = None
+        if self._last_recycle_at is not None:
+            last = {
+                "at": self._last_recycle_at,
+                "reason": self._last_recycle_reason,
+            }
+
+        return {
+            "uptime_s": int(self._clock() - self._started_at),
+            "rss_mb": metrics["rss_mb"],
+            "threads": metrics["threads"],
+            "fds": metrics["fds"],
+            "plugin_reloads": self._get_reload_count(),
+            "last_recycle": last,
+            "warnings": warnings,
+        }

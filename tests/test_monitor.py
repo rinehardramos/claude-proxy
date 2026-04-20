@@ -1,4 +1,4 @@
-from monitor import collect_metrics, evaluate_thresholds, Thresholds
+from monitor import collect_metrics, evaluate_thresholds, Thresholds, ResourceMonitor
 
 
 def test_collect_metrics_returns_expected_keys():
@@ -59,3 +59,69 @@ def test_evaluate_detects_reload_count():
     breach = evaluate_thresholds(metrics, 51, t)
     assert breach is not None
     assert breach.reason == "reloads_exceeded"
+
+
+class FakeClock:
+    def __init__(self, start=0.0):
+        self.t = start
+    def now(self) -> float:
+        return self.t
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+def test_monitor_snapshot_includes_all_fields():
+    clock = FakeClock()
+    mon = ResourceMonitor(
+        thresholds=Thresholds(),
+        get_reload_count=lambda: 0,
+        clock=clock.now,
+        metrics_source=lambda: {"rss_mb": 42, "threads": 8, "fds": 14, "fd_limit": 1024},
+    )
+    snap = mon.snapshot()
+    assert set(snap.keys()) >= {"uptime_s", "rss_mb", "threads", "fds", "plugin_reloads", "last_recycle", "warnings"}
+    assert snap["rss_mb"] == 42
+    assert snap["plugin_reloads"] == 0
+    assert snap["last_recycle"] is None
+
+
+def test_monitor_recycle_decision_respects_cooldown():
+    clock = FakeClock(start=1000.0)
+    breached_metrics = {"rss_mb": 600, "threads": 8, "fds": 14, "fd_limit": 1024}
+    mon = ResourceMonitor(
+        thresholds=Thresholds(rss_mb=512),
+        get_reload_count=lambda: 0,
+        clock=clock.now,
+        metrics_source=lambda: breached_metrics,
+        cooldown_s=600,
+    )
+    # First breach → recycle requested
+    assert mon.should_recycle() is not None
+    mon.mark_recycled("rss_exceeded")
+
+    # Immediately after → still in cooldown, no recycle
+    assert mon.should_recycle() is None
+
+    # After cooldown elapses → recycle again
+    clock.advance(601)
+    assert mon.should_recycle() is not None
+
+
+def test_monitor_kill_switch_via_env(monkeypatch):
+    monkeypatch.setenv("CLAUDE_PROXY_MONITOR", "off")
+    mon = ResourceMonitor(
+        thresholds=Thresholds(rss_mb=1),  # trivially breached
+        get_reload_count=lambda: 0,
+        metrics_source=lambda: {"rss_mb": 999, "threads": 8, "fds": 14, "fd_limit": 1024},
+    )
+    assert mon.should_recycle() is None
+
+
+def test_monitor_snapshot_warnings_when_near_cap():
+    mon = ResourceMonitor(
+        thresholds=Thresholds(rss_mb=100),
+        get_reload_count=lambda: 0,
+        metrics_source=lambda: {"rss_mb": 85, "threads": 8, "fds": 14, "fd_limit": 1024},
+    )
+    snap = mon.snapshot()
+    assert any("rss" in w for w in snap["warnings"])
