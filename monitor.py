@@ -9,6 +9,7 @@ import os
 import resource
 import sys
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 
 try:
@@ -70,3 +71,31 @@ def collect_metrics() -> dict:
         "fds": _fd_count(),
         "fd_limit": _fd_soft_limit(),
     }
+
+
+@dataclass(frozen=True)
+class Thresholds:
+    rss_mb: int = 512
+    threads: int = 200
+    fd_pct: float = 0.8
+    reloads: int = 50
+
+
+@dataclass(frozen=True)
+class Breach:
+    reason: str
+    value: int
+    threshold: int
+
+
+def evaluate_thresholds(metrics: dict, reload_count: int, t: Thresholds) -> Breach | None:
+    if metrics["rss_mb"] > t.rss_mb:
+        return Breach("rss_exceeded", metrics["rss_mb"], t.rss_mb)
+    if metrics["threads"] > t.threads:
+        return Breach("threads_exceeded", metrics["threads"], t.threads)
+    fd_limit = int(metrics["fd_limit"] * t.fd_pct)
+    if metrics["fds"] > fd_limit:
+        return Breach("fds_near_limit", metrics["fds"], fd_limit)
+    if reload_count > t.reloads:
+        return Breach("reloads_exceeded", reload_count, t.reloads)
+    return None
