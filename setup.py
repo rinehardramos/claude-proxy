@@ -623,13 +623,16 @@ def cmd_list_plugins(args: argparse.Namespace) -> None:
 
 
 def cmd_restart(args: argparse.Namespace) -> None:
-    """Kill running proxy and start a fresh one."""
-    state_dir = _default_state_dir()
-    project_dir = _default_project_dir()
-    proxy_py = project_dir / "proxy.py"
+    """Restart the proxy.
 
-    # Try hot-reload first — faster than a full restart for plugin edits.
-    if proxy_status() is not None:
+    Prefer hot-reload for plugin edits. If a supervisor is installed, delegate
+    the full restart to it; otherwise fall back to the legacy kill+spawn path.
+    """
+    adapter = get_adapter()
+    force = getattr(args, "force", False)
+
+    # Hot-reload first — regardless of supervisor, if the proxy is responsive.
+    if proxy_status() is not None and not force:
         try:
             url = "http://127.0.0.1:18019/reload"
             with urllib.request.urlopen(url, timeout=3) as resp:
@@ -642,12 +645,21 @@ def cmd_restart(args: argparse.Namespace) -> None:
                     print(f"  Plugins: {', '.join(plugins) if plugins else 'none'}")
                 return
         except Exception:
-            pass  # Fall through to full restart
+            pass  # Fall through
 
+    if adapter.is_installed() and not force:
+        print("[claude-proxy] Restarting via supervisor...")
+        adapter.restart()
+        print("[claude-proxy] Restart requested.")
+        return
+
+    # Legacy fallback path — no supervisor, or --force
+    state_dir = _default_state_dir()
+    project_dir = _default_project_dir()
+    proxy_py = project_dir / "proxy.py"
     print("[claude-proxy] Stopping proxy...")
     kill_proxy(state_dir)
 
-    # Wait for port to be freed
     for _ in range(20):
         time.sleep(0.25)
         import socket
@@ -660,7 +672,6 @@ def cmd_restart(args: argparse.Namespace) -> None:
         stdout=subprocess.DEVNULL,
         stderr=open(state_dir / "proxy.log", "a"),
     )
-    # Wait for health check
     for _ in range(10):
         time.sleep(0.3)
         if proxy_status() is not None:
@@ -678,16 +689,41 @@ def cmd_restart(args: argparse.Namespace) -> None:
 
 
 def cmd_status(args: argparse.Namespace) -> None:
-    """Show proxy health status."""
+    """Show proxy + supervisor health."""
+    adapter = get_adapter()
+    sup_status = adapter.status() if adapter.is_installed() else None
     result = proxy_status()
+
     if result is None:
         print("[claude-proxy] Proxy is not running.")
+        if sup_status:
+            print(
+                f"  Supervisor: loaded={sup_status['loaded']} "
+                f"running={sup_status['running']} "
+                f"last_exit={sup_status.get('last_exit')}"
+            )
         sys.exit(1)
+
     print("[claude-proxy] Proxy is running.")
     print(f"  Status:    {result.get('status', 'unknown')}")
-    plugins = result.get("plugins", [])
+    plugins = result.get("plugins", []) or []
     print(f"  Plugins:   {', '.join(plugins) if plugins else 'none'}")
+    if "uptime_s" in result:
+        print(f"  Uptime:    {result['uptime_s']}s")
+        print(f"  RSS:       {result.get('rss_mb', '?')} MB")
+        print(f"  Threads:   {result.get('threads', '?')}")
+        print(f"  FDs:       {result.get('fds', '?')}")
+        print(f"  Reloads:   {result.get('plugin_reloads', 0)}")
+        warnings = result.get("warnings", []) or []
+        if warnings:
+            print("  Warnings:")
+            for w in warnings:
+                print(f"    - {w}")
+        else:
+            print("  Warnings:  none")
     print(f"  Sideload:  {result.get('sideload_pending', 0)} pending")
+    if sup_status:
+        print(f"  Supervisor: pid={sup_status.get('pid')} loaded={sup_status.get('loaded')}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -708,7 +744,9 @@ def build_parser() -> argparse.ArgumentParser:
     rm_p.add_argument("name", help="Plugin name (e.g. telegram)")
 
     sub.add_parser("list-plugins", help="Show installed plugins and status")
-    sub.add_parser("restart", help="Kill and restart the proxy")
+    restart_p = sub.add_parser("restart", help="Kill and restart the proxy")
+    restart_p.add_argument("--force", action="store_true",
+                           help="Skip hot-reload and supervisor; kill+spawn directly")
     sub.add_parser("status", help="Show proxy health status")
 
     return parser

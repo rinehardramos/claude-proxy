@@ -985,5 +985,40 @@ class TestInstallCmd(unittest.TestCase):
         mock_uninstall.assert_called_once()
 
 
+def test_cmd_restart_uses_adapter(monkeypatch):
+    import setup
+    calls = []
+
+    class FakeAdapter:
+        def is_installed(self): return True
+        def restart(self): calls.append("restart")
+
+    monkeypatch.setattr(setup, "get_adapter", lambda: FakeAdapter())
+    # Prevent the hot-reload branch from returning early
+    monkeypatch.setattr(setup, "proxy_status", lambda: None)
+    import argparse
+    setup.cmd_restart(argparse.Namespace(force=False))
+    assert "restart" in calls
+
+
+def test_cmd_status_includes_monitor_metrics(monkeypatch, capsys):
+    import setup
+    monkeypatch.setattr(setup, "proxy_status", lambda: {
+        "status": "ok", "plugins": [], "uptime_s": 300,
+        "rss_mb": 42, "threads": 8, "fds": 14,
+        "plugin_reloads": 1, "warnings": [],
+    })
+    class FakeAdapter:
+        def is_installed(self): return True
+        def status(self): return {"loaded": True, "running": True, "pid": 123, "last_exit": 0}
+    monkeypatch.setattr(setup, "get_adapter", lambda: FakeAdapter())
+
+    import argparse
+    setup.cmd_status(argparse.Namespace())
+    out = capsys.readouterr().out
+    assert "rss" in out.lower()
+    assert "uptime" in out.lower() or "300" in out
+
+
 if __name__ == "__main__":
     unittest.main()
