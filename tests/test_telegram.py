@@ -597,6 +597,27 @@ class TestOnInbound(unittest.TestCase):
         _, captured = self._call_and_capture("response", {"model": "claude"})
         self.assertEqual(len(captured), 1)
 
+    def _call_with_message_ids(self, response_text, request_summary, ids):
+        """urlopen returns sequential message_ids so the registry can record them."""
+        seq = list(ids)
+        def mock_urlopen(req, timeout=None):
+            mid = seq.pop(0) if seq else 1
+            class R:
+                def read(self_inner):
+                    return json.dumps({"ok": True, "result": {"message_id": mid}}).encode()
+            return R()
+        with patch.object(urllib.request, "urlopen", side_effect=mock_urlopen):
+            self.t.on_inbound(response_text, request_summary)
+            for th in threading.enumerate():
+                if th.daemon and th is not threading.current_thread():
+                    th.join(timeout=2)
+
+    def test_on_inbound_records_message_cwd(self):
+        self._call_with_message_ids(
+            "hello", {"user_text": "hi", "cwd": "/home/u/projX"}, ids=[777])
+        self.assertEqual(self.t._cwd_for_message(777), "/home/u/projX")
+        self.assertEqual(self.t._last_active_cwd, "/home/u/projX")
+
 
 class TestTTSPathIntegration(unittest.TestCase):
     def setUp(self):

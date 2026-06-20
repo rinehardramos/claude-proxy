@@ -456,7 +456,14 @@ def on_inbound(response_text: str, request_summary: dict) -> str | None:
                     req = urllib.request.Request(
                         tg_url, data=data, headers={"Content-Type": "application/json"},
                     )
-                    urllib.request.urlopen(req, timeout=10)
+                    resp = urllib.request.urlopen(req, timeout=10)
+                    try:
+                        result = json.loads(resp.read())
+                        mid = result.get("result", {}).get("message_id")
+                    except Exception:
+                        mid = None
+                    if cwd:
+                        _record_message_target(mid, cwd)
                 except Exception as exc:
                     _log(f"ERROR: {exc}")
         except Exception as exc:
