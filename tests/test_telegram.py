@@ -1414,5 +1414,60 @@ class TestResolveTarget(unittest.TestCase):
         self.assertEqual(self.t._resolve_target(msg), "/p/last")
 
 
+class TestProjectCommand(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.t.HOOK_DIR = Path(self.tmp)
+        self.t._CWD_OVERRIDE_FILE = Path(self.tmp) / "cwd_override"
+        self.t._INBOX_DIR = Path(self.tmp) / "session-inbox"
+        self.t._INBOX_FAILED_DIR = self.t._INBOX_DIR / "failed"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_set_override_valid(self):
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": f"/project {self.tmp}"}, "tok", "chat")
+        self.assertEqual(self.t._get_cwd_override(), str(Path(self.tmp).resolve()))
+
+    def test_set_override_invalid_rejected(self):
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message(
+                {"text": f"/project {self.tmp}/nope"}, "tok", "chat")
+        self.assertIsNone(self.t._get_cwd_override())
+
+    def test_clear_override(self):
+        self.t._set_cwd_override(self.tmp)
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "/project clear"}, "tok", "chat")
+        self.assertIsNone(self.t._get_cwd_override())
+
+    def test_oneshot_resume_mode_writes_inbox(self):
+        self.t._delivery_mode = "resume"
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message(
+                {"text": f"/project {self.tmp} do the thing"}, "tok", "chat")
+        items = self.t._inbox_list()
+        self.assertEqual(len(items), 1)
+        info = json.loads(items[0].read_text())
+        self.assertEqual(info["text"], "do the thing")
+        self.assertEqual(info["cwd"], str(Path(self.tmp).resolve()))
+        # oneshot must NOT change sticky override
+        self.assertIsNone(self.t._get_cwd_override())
+
+    def test_show_does_not_crash(self):
+        with patch("urllib.request.urlopen") as m:
+            self.t._handle_text_message({"text": "/project"}, "tok", "chat")
+        self.assertTrue(m.called)
+
+    def test_project_not_treated_as_plain_message(self):
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "/project clear"}, "tok", "chat")
+        self.assertEqual(self.t._pending_replies, [])
+
+
 if __name__ == "__main__":
     unittest.main()

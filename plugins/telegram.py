@@ -870,6 +870,43 @@ def _handle_text_message(msg: dict, token: str, chat_id: str) -> None:
                        f"Usage: /mode auto-approve | ask | auto-deny")
         return
 
+    # /project command — project targeting
+    if text.lower() == "/project" or text.lower().startswith("/project "):
+        action, path, prompt = _parse_project_command(text)
+        if action == "show":
+            ov = _get_cwd_override()
+            effective = ov or _last_active_cwd or "(none)"
+            lines = [f"Target: {effective}", f"Override: {ov or '(none)'}"]
+            recents = _recent_cwds()
+            if recents:
+                lines.append("Recent:\n" + "\n".join(f"• {c}" for c in recents))
+            _send_text(token, chat_id, "\n".join(lines))
+            return
+        if action == "clear":
+            _clear_cwd_override()
+            _send_text(token, chat_id, "✅ Override cleared")
+            return
+        if action == "set":
+            ok, resolved = _set_cwd_override(path)
+            if ok:
+                _send_text(token, chat_id, f"✅ Project: {resolved}")
+            else:
+                _send_text(token, chat_id, f"⚠ Not a directory: {resolved}")
+            return
+        if action == "oneshot":
+            resolved = _normalize_cwd(path)
+            if not Path(resolved).is_dir():
+                _send_text(token, chat_id, f"⚠ Not a directory: {resolved}")
+                return
+            if _delivery_mode == "resume":
+                _inbox_put(prompt, resolved)
+                _send_text(token, chat_id, f"✅ Sent to {os.path.basename(resolved)}")
+            else:
+                with _pending_replies_lock:
+                    _pending_replies.append(prompt)
+                _send_text(token, chat_id, "✅ Queued (inject mode — lands on next request)")
+            return
+
     # Session-monitor text reply: user typed text after tapping 💬 Reply
     _log(f"text msg received: csm_pid={_csm_waiting_reply_pid} waiting_reply={_waiting_for_reply}")
     if _csm_waiting_reply_pid is not None:
