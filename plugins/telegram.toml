@@ -39,3 +39,30 @@ approval_poller = "true"
 # Scanner for the approval hook: "always" (ask for every tool call),
 # "leak-guard" (only when PII detected), "none" (disabled)
 approval_scanner = "always"
+
+# ── Session delivery ─────────────────────────────────────────────────────
+# How messages typed in the channel reach the running Claude Code session:
+#   "inject" (default) — queued and injected into the session's NEXT request
+#                        (works while a session is active; does not wake idle)
+#   "resume"           — actively delivered to the project via
+#                        `claude --continue`, waking idle sessions and
+#                        preserving conversation context
+delivery_mode = "inject"
+
+# Path to the Claude Code CLI (the proxy daemon's PATH may differ from your
+# shell; use an absolute path if `claude` is not found):
+# claude_bin = "claude"
+
+# Seconds before a headless delivery run is killed:
+# resume_timeout = 300
+
+# Max delivery attempts before moving a message to session-inbox/failed/:
+# resume_max_attempts = 3
+
+# Telegram commands (sent in the channel):
+#   /project                       show current target + override + recent cwds
+#   /project <path>                set sticky target (validated dir on host)
+#   /project <path> <prompt>       one-shot: deliver <prompt> to <path> now
+#   /project clear | /project off  clear sticky target
+# Plain (non-command) messages go to the default target:
+#   native reply-to > /project override > last-active project.
