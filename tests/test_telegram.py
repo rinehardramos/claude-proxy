@@ -1313,5 +1313,34 @@ class TestCwdOverride(unittest.TestCase):
         self.assertIsNone(self.t._get_cwd_override())
 
 
+class TestParseProjectCommand(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+
+    def test_no_arg_is_show(self):
+        self.assertEqual(self.t._parse_project_command("/project"), ("show", None, None))
+
+    def test_path_only_is_set(self):
+        self.assertEqual(
+            self.t._parse_project_command("/project ~/foo"), ("set", "~/foo", None))
+
+    def test_path_plus_prompt_is_oneshot(self):
+        self.assertEqual(
+            self.t._parse_project_command("/project ~/foo fix the test"),
+            ("oneshot", "~/foo", "fix the test"))
+
+    def test_clear_keyword(self):
+        self.assertEqual(self.t._parse_project_command("/project clear"), ("clear", None, None))
+
+    def test_off_keyword(self):
+        self.assertEqual(self.t._parse_project_command("/project off"), ("clear", None, None))
+
+    def test_quoted_path_with_spaces(self):
+        action, path, prompt = self.t._parse_project_command('/project "~/my proj" do it')
+        self.assertEqual(action, "oneshot")
+        self.assertEqual(path, "~/my proj")
+        self.assertEqual(prompt, "do it")
+
+
 if __name__ == "__main__":
     unittest.main()

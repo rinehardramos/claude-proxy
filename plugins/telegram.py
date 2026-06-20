@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -395,6 +396,33 @@ def configure(config: dict) -> None:
 # ── Option extraction ────────────────────────────────────────────────────
 
 _NUMBERED_OPTION_RE = re.compile(r"^\s*(\d+)\.\s+(.+)$", re.MULTILINE)
+
+
+def _parse_project_command(text: str) -> tuple[str, str | None, str | None]:
+    """Parse a /project command into (action, path, prompt).
+
+    Forms:
+      /project                 → ("show", None, None)
+      /project <path>          → ("set", path, None)
+      /project <path> <prompt> → ("oneshot", path, prompt)
+      /project clear | off     → ("clear", None, None)
+    Quoted paths with spaces are honored.
+    """
+    body = text[len("/project"):].strip()
+    if not body:
+        return ("show", None, None)
+    try:
+        tokens = shlex.split(body)
+    except ValueError:
+        tokens = body.split()
+    if not tokens:
+        return ("show", None, None)
+    path = tokens[0]
+    if path.lower() in ("clear", "off"):
+        return ("clear", None, None)
+    if len(tokens) > 1:
+        return ("oneshot", path, " ".join(tokens[1:]))
+    return ("set", path, None)
 
 
 def _extract_options(text: str) -> list[str] | None:
