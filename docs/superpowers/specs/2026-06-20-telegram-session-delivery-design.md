@@ -121,9 +121,14 @@ on_inbound() (existing) ──▶ Claude's answer posted to Telegram
    `/mute` and `/mode`). Lets the user resume a project other than the last-active one —
    the escape hatch for the shared-cwd limitation and for projects with no recent
    notification. Feeds resolution step 2 above.
-   - `/cwd <path>` — set a **sticky** override. Validated: must be an existing directory
-     **on the proxy host** (that is where `claude --continue` runs). Invalid → reject
-     with a clear Telegram error; override unchanged.
+   - `/cwd <path>` — set a **sticky** override. The path is **normalized before
+     validation**: `os.path.expandvars` (for `$HOME`-style vars) → `Path.expanduser`
+     (for `~`, resolving to the **proxy daemon's** home, since that user runs
+     `claude --continue`) → `Path.resolve` (absolute, symlink-collapsed). The normalized
+     absolute path must be an existing directory **on the proxy host**. Invalid → reject
+     with a clear Telegram error showing the resolved path; override unchanged. The
+     stored override is always the absolute resolved path, so `~`/relative/`$VAR` forms
+     all work (e.g. `/cwd ~/project_name`).
    - `/cwd` (no arg) — show the current effective target and override state, plus the
      recently-seen cwds from the registry (so the user knows valid options).
    - `/cwd clear` / `/cwd off` — drop the override; revert to `_last_active_cwd`.
@@ -202,6 +207,8 @@ Unit (pure, no network/subprocess):
 - `/cwd` command: set valid dir succeeds + persists; set non-existent dir rejected,
   override unchanged; `/cwd clear` reverts to last-active; `/cwd` no-arg reports state;
   override loaded from `cwd_override` file on configure()
+- `/cwd` path normalization: `~/x`, `$HOME/x`, and relative paths expand to the same
+  absolute resolved dir and validate; stored value is the absolute path
 - inbox: put/list/complete/fail round-trips; `failed/` move; malformed file skipped
 - `on_tick`: drains pending items; per-cwd in-flight guard prevents double-spawn;
   increments attempts on failure; moves to `failed/` after max; respawns dead poller
