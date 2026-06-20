@@ -230,7 +230,7 @@ _register_tts("pyttsx3", _check_pyttsx3, _generate_pyttsx3)
 def plugin_info() -> dict:
     return {
         "name": "telegram",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "description": "Telegram notifications with TTS audio fallback",
     }
 
@@ -742,6 +742,15 @@ def _handle_text_message(msg: dict, token: str, chat_id: str) -> None:
         _send_text(token, chat_id, "\u2705 Reply queued")
         _log(f"reply-to queued ({len(text)} chars)")
         return
+
+    # Fallback: any other plain message in the channel is forwarded to the
+    # running Claude Code session. It's queued here and injected into the
+    # session's next outbound request by on_outbound() as a <system-reminder>.
+    # No Reply button or native reply required \u2014 just type and send.
+    with _pending_replies_lock:
+        _pending_replies.append(text)
+    _send_text(token, chat_id, "\u2705 Sent to session")
+    _log(f"message forwarded to session ({len(text)} chars)")
 
 
 def _handle_option_callback(cb: dict, token: str, chat_id: str, option_index: str) -> None:

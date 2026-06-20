@@ -1133,6 +1133,30 @@ class TestHandleTextMessage(unittest.TestCase):
     def test_mode_default_is_ask(self):
         self.assertEqual(self.t._approval_mode, "ask")
 
+    def test_plain_message_forwarded_to_session(self):
+        """Any plain (non-command) message is queued for the running session."""
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "do the thing"}, "tok", "chat")
+        self.assertEqual(self.t._pending_replies, ["do the thing"])
+
+    def test_plain_message_sends_confirmation(self):
+        """Forwarding a plain message sends a confirmation back to Telegram."""
+        with patch("urllib.request.urlopen") as mock_url:
+            self.t._handle_text_message({"text": "hello session"}, "tok", "chat")
+        self.assertTrue(mock_url.called)
+
+    def test_blank_message_not_forwarded(self):
+        """Whitespace-only messages are ignored, not forwarded."""
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "   "}, "tok", "chat")
+        self.assertEqual(self.t._pending_replies, [])
+
+    def test_command_not_forwarded_as_message(self):
+        """Recognized commands are handled, not forwarded to the session."""
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "/mute"}, "tok", "chat")
+        self.assertEqual(self.t._pending_replies, [])
+
 
 def test_telegram_on_monitor_recycle_formats_message(monkeypatch):
     import plugins.telegram as tg

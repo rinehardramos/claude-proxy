@@ -27,8 +27,13 @@ chat_id   = "-5123265276"
 # tts_openai_api_key_env = "OPENAI_API_KEY"
 
 # Remote approval via Telegram inline buttons.
-# Enable the callback poller that listens for Approve/Deny button presses.
-# Requires the PreToolUse hook script (hooks/telegram_approve.py).
+# Enable the callback poller that long-polls Telegram getUpdates. It listens
+# for Approve/Deny button presses AND for messages you type in the channel:
+# any plain message (not a /command) is forwarded to the running Claude Code
+# session, injected into its next request as a <system-reminder>. No Reply
+# button needed — just type and send. (Reaches the session on its next API
+# request; it does not wake a fully idle session.)
+# Requires the PreToolUse hook script (hooks/telegram_approve.py) for approvals.
 approval_poller = "true"
 
 # Scanner for the approval hook: "always" (ask for every tool call),
