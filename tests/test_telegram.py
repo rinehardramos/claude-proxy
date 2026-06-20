@@ -1469,5 +1469,46 @@ class TestProjectCommand(unittest.TestCase):
         self.assertEqual(self.t._pending_replies, [])
 
 
+class TestPlainMessageRouting(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.t.HOOK_DIR = Path(self.tmp)
+        self.t._INBOX_DIR = Path(self.tmp) / "session-inbox"
+        self.t._INBOX_FAILED_DIR = self.t._INBOX_DIR / "failed"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_resume_mode_routes_to_inbox(self):
+        self.t._delivery_mode = "resume"
+        self.t._last_active_cwd = "/home/u/projY"
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "run the tests"}, "tok", "chat")
+        items = self.t._inbox_list()
+        self.assertEqual(len(items), 1)
+        info = json.loads(items[0].read_text())
+        self.assertEqual(info["text"], "run the tests")
+        self.assertEqual(info["cwd"], "/home/u/projY")
+        self.assertEqual(self.t._pending_replies, [])
+
+    def test_inject_mode_still_queues(self):
+        self.t._delivery_mode = "inject"
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "hello"}, "tok", "chat")
+        self.assertEqual(self.t._pending_replies, ["hello"])
+        self.assertEqual(self.t._inbox_list(), [])
+
+    def test_resume_mode_no_target_falls_back_to_queue(self):
+        self.t._delivery_mode = "resume"
+        self.t._last_active_cwd = None
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "hello"}, "tok", "chat")
+        self.assertEqual(self.t._pending_replies, ["hello"])
+        self.assertEqual(self.t._inbox_list(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

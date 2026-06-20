@@ -938,10 +938,16 @@ def _handle_text_message(msg: dict, token: str, chat_id: str) -> None:
         _log(f"reply-to queued ({len(text)} chars)")
         return
 
-    # Fallback: any other plain message in the channel is forwarded to the
-    # running Claude Code session. It's queued here and injected into the
-    # session's next outbound request by on_outbound() as a <system-reminder>.
-    # No Reply button or native reply required \u2014 just type and send.
+    # Fallback: any other plain message is forwarded to the running session.
+    # In "resume" mode it is delivered to the resolved project via the inbox
+    # (wakes idle sessions). In "inject" mode (or when no target is known) it
+    # is queued for on_outbound() to inject into the session's next request.
+    target = _resolve_target(msg)
+    if _delivery_mode == "resume" and target:
+        _inbox_put(text, target)
+        _send_text(token, chat_id, f"\u2705 Sent to {os.path.basename(target)}")
+        _log(f"message \u2192 inbox for {target} ({len(text)} chars)")
+        return
     with _pending_replies_lock:
         _pending_replies.append(text)
     _send_text(token, chat_id, "\u2705 Sent to session")
