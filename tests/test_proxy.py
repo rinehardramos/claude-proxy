@@ -838,15 +838,23 @@ class TestMainDedup(unittest.TestCase):
         self.assertEqual(cm.exception.code, 0)
 
     def test_does_not_exit_when_proxy_not_running(self):
-        """main() must proceed when no instance is running."""
-        # We stop it after argparse so we don't actually bind to a port.
+        """main() must proceed when no instance is running.
+
+        PluginManager and ResourceMonitor are mocked so main() does not load the
+        real plugins dir — doing so starts a live Telegram poller against the
+        real bot credentials, leaking a thread that pollutes other test modules
+        when the whole suite runs in one process.
+        """
         class _StopEarly(Exception):
             pass
 
-        def _fake_server(*a, **kw):
-            raise _StopEarly
+        mock_mgr = unittest.mock.MagicMock()
+        mock_mgr.plugins = []
+        mock_mgr.reload_count = 0
 
         with unittest.mock.patch.object(_proxy_mod, "is_proxy_running", return_value=False), \
+             unittest.mock.patch.object(_proxy_mod, "PluginManager", return_value=mock_mgr), \
+             unittest.mock.patch("monitor.ResourceMonitor"), \
              unittest.mock.patch.object(_proxy_mod, "_acquire_startup_lock", return_value=99), \
              unittest.mock.patch.object(_proxy_mod, "_port_in_use", return_value=False):
             with unittest.mock.patch("sys.argv", ["proxy.py"]):
