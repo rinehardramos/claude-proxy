@@ -325,6 +325,21 @@ def _load_cwd_override() -> None:
         _cwd_override = val
 
 
+def _resolve_target(msg: dict) -> str | None:
+    """Resolve the target project cwd for an incoming message.
+
+    Precedence: native reply-to-bot → /project override → last-active.
+    """
+    reply_to = msg.get("reply_to_message", {})
+    if reply_to.get("from", {}).get("is_bot"):
+        cwd = _cwd_for_message(reply_to.get("message_id"))
+        if cwd:
+            return cwd
+    if _cwd_override:
+        return _cwd_override
+    return _last_active_cwd
+
+
 # ── Plugin interface ──────────────────────────────────────────────────────
 
 def plugin_info() -> dict:

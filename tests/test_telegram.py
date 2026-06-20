@@ -1385,5 +1385,34 @@ class TestInbox(unittest.TestCase):
         self.assertEqual(self.t._inbox_list(), [])
 
 
+class TestResolveTarget(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+
+    def test_native_reply_wins(self):
+        self.t._record_message_target(5, "/p/replytarget")
+        self.t._cwd_override = "/p/override"
+        self.t._last_active_cwd = "/p/last"
+        msg = {"reply_to_message": {"from": {"is_bot": True}, "message_id": 5}}
+        self.assertEqual(self.t._resolve_target(msg), "/p/replytarget")
+
+    def test_override_used_when_no_reply(self):
+        self.t._cwd_override = "/p/override"
+        self.t._last_active_cwd = "/p/last"
+        self.assertEqual(self.t._resolve_target({}), "/p/override")
+
+    def test_last_active_when_no_override(self):
+        self.t._last_active_cwd = "/p/last"
+        self.assertEqual(self.t._resolve_target({}), "/p/last")
+
+    def test_none_when_nothing_known(self):
+        self.assertIsNone(self.t._resolve_target({}))
+
+    def test_reply_to_unknown_message_falls_through(self):
+        self.t._last_active_cwd = "/p/last"
+        msg = {"reply_to_message": {"from": {"is_bot": True}, "message_id": 999}}
+        self.assertEqual(self.t._resolve_target(msg), "/p/last")
+
+
 if __name__ == "__main__":
     unittest.main()
