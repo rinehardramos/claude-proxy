@@ -273,6 +273,57 @@ _register_tts("openai", _check_openai, _generate_openai)
 _register_tts("pyttsx3", _check_pyttsx3, _generate_pyttsx3)
 
 
+# ── Project cwd override (/project sticky target) ────────────────────────
+
+_CWD_OVERRIDE_FILE = HOOK_DIR / "cwd_override"
+_cwd_override: str | None = None
+
+
+def _normalize_cwd(path: str) -> str:
+    """expandvars → expanduser → resolve to an absolute path string."""
+    expanded = os.path.expandvars(path)
+    return str(Path(expanded).expanduser().resolve())
+
+
+def _set_cwd_override(path: str) -> tuple[bool, str]:
+    """Validate and persist a sticky project override. Returns (ok, resolved)."""
+    global _cwd_override
+    resolved = _normalize_cwd(path)
+    if not Path(resolved).is_dir():
+        return False, resolved
+    _cwd_override = resolved
+    try:
+        HOOK_DIR.mkdir(parents=True, exist_ok=True)
+        _CWD_OVERRIDE_FILE.write_text(resolved)
+    except OSError as exc:
+        _log(f"could not persist cwd override: {exc}")
+    return True, resolved
+
+
+def _get_cwd_override() -> str | None:
+    return _cwd_override
+
+
+def _clear_cwd_override() -> None:
+    global _cwd_override
+    _cwd_override = None
+    try:
+        _CWD_OVERRIDE_FILE.unlink()
+    except OSError:
+        pass
+
+
+def _load_cwd_override() -> None:
+    """Restore a persisted override if its directory still exists."""
+    global _cwd_override
+    try:
+        val = _CWD_OVERRIDE_FILE.read_text().strip()
+    except OSError:
+        return
+    if val and Path(val).is_dir():
+        _cwd_override = val
+
+
 # ── Plugin interface ──────────────────────────────────────────────────────
 
 def plugin_info() -> dict:
@@ -337,6 +388,8 @@ def configure(config: dict) -> None:
     # Start callback poller for inline keyboard responses (opt-in)
     if config.get("approval_poller", "").lower() in ("true", "1", "yes", "on"):
         _start_poller()
+
+    _load_cwd_override()
 
 
 # ── Option extraction ────────────────────────────────────────────────────

@@ -1266,5 +1266,52 @@ class TestMessageRegistry(unittest.TestCase):
         self.assertEqual(self.t._recent_cwds(), ["/p/a", "/p/b"])
 
 
+class TestCwdOverride(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.t.HOOK_DIR = Path(self.tmp)
+        self.t._CWD_OVERRIDE_FILE = Path(self.tmp) / "cwd_override"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_set_valid_dir_succeeds_and_persists(self):
+        ok, resolved = self.t._set_cwd_override(self.tmp)
+        self.assertTrue(ok)
+        self.assertEqual(resolved, str(Path(self.tmp).resolve()))
+        self.assertEqual(self.t._get_cwd_override(), resolved)
+        self.assertEqual(self.t._CWD_OVERRIDE_FILE.read_text().strip(), resolved)
+
+    def test_set_invalid_dir_rejected_state_unchanged(self):
+        ok, resolved = self.t._set_cwd_override(self.tmp + "/nope")
+        self.assertFalse(ok)
+        self.assertIsNone(self.t._get_cwd_override())
+
+    def test_normalize_expands_tilde(self):
+        # ~ resolves to the proxy user's home; just assert no literal ~ remains
+        norm = self.t._normalize_cwd("~/somewhere")
+        self.assertNotIn("~", norm)
+        self.assertTrue(norm.startswith("/"))
+
+    def test_clear_removes_override_and_file(self):
+        self.t._set_cwd_override(self.tmp)
+        self.t._clear_cwd_override()
+        self.assertIsNone(self.t._get_cwd_override())
+        self.assertFalse(self.t._CWD_OVERRIDE_FILE.exists())
+
+    def test_load_restores_persisted_override(self):
+        self.t._CWD_OVERRIDE_FILE.write_text(str(Path(self.tmp).resolve()))
+        self.t._load_cwd_override()
+        self.assertEqual(self.t._get_cwd_override(), str(Path(self.tmp).resolve()))
+
+    def test_load_ignores_deleted_dir(self):
+        self.t._CWD_OVERRIDE_FILE.write_text("/nonexistent/dir/xyz")
+        self.t._load_cwd_override()
+        self.assertIsNone(self.t._get_cwd_override())
+
+
 if __name__ == "__main__":
     unittest.main()
