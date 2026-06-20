@@ -87,7 +87,7 @@ on_inbound() (existing) ──▶ Claude's answer posted to Telegram
    Precedence, most specific first:
    1. native reply (`reply_to_message.message_id`) → registry lookup → cwd
       (also option/reply button callbacks → their message's id → registry → cwd)
-   2. **`/cwd` override** (if set) → override cwd
+   2. **`/project` sticky override** (if set) → override cwd
    3. plain typed message with no override → `_last_active_cwd`
    - unresolved → fall back to `inject` behavior (queue in `_pending_replies`) and tell
      the user it'll land on the session's next request.
@@ -117,25 +117,40 @@ on_inbound() (existing) ──▶ Claude's answer posted to Telegram
    via `_start_poller()`. This makes the shared supervised tick the watchdog for the
    long-poll thread, closing the "thread silently died" gap.
 
-6. **`/cwd` command — manual project override** (in `_handle_text_message`, alongside
-   `/mute` and `/mode`). Lets the user resume a project other than the last-active one —
-   the escape hatch for the shared-cwd limitation and for projects with no recent
-   notification. Feeds resolution step 2 above.
-   - `/cwd <path>` — set a **sticky** override. The path is **normalized before
-     validation**: `os.path.expandvars` (for `$HOME`-style vars) → `Path.expanduser`
-     (for `~`, resolving to the **proxy daemon's** home, since that user runs
-     `claude --continue`) → `Path.resolve` (absolute, symlink-collapsed). The normalized
-     absolute path must be an existing directory **on the proxy host**. Invalid → reject
-     with a clear Telegram error showing the resolved path; override unchanged. The
-     stored override is always the absolute resolved path, so `~`/relative/`$VAR` forms
-     all work (e.g. `/cwd ~/project_name`).
-   - `/cwd` (no arg) — show the current effective target and override state, plus the
+6. **`/project` command — manual project targeting** (in `_handle_text_message`,
+   alongside `/mute` and `/mode`). Lets the user resume a project other than the
+   last-active one — the escape hatch for the shared-cwd limitation and for projects with
+   no recent notification. Parsed by splitting into at most 3 parts:
+   `["/project", "<path>", "<prompt…>"]`.
+
+   **Path normalization** (applied to the `<path>` token before validation):
+   `os.path.expandvars` (for `$HOME`-style vars) → `Path.expanduser` (for `~`, resolving
+   to the **proxy daemon's** home, since that user runs `claude --continue`) →
+   `Path.resolve` (absolute, symlink-collapsed). The normalized absolute path must be an
+   existing directory **on the proxy host**; invalid → reject with a Telegram error
+   showing the resolved path, state unchanged. The stored value is always the absolute
+   resolved path, so `~`/relative/`$VAR` forms all work. Paths containing spaces must be
+   quoted (`/project "~/my project" do the thing`).
+
+   Forms:
+   - `/project` (no arg) — show the current effective target + sticky-override state +
      recently-seen cwds from the registry (so the user knows valid options).
-   - `/cwd clear` / `/cwd off` — drop the override; revert to `_last_active_cwd`.
-   Persisted to `telegram-hook/cwd_override` so it survives a proxy recycle; loaded on
-   `configure()`. Override applies to `resume` mode; in `inject` mode it is accepted and
-   shown but only affects behavior once `resume` mode is active.
-   *Unit:* `_set_cwd_override(path) -> ok|err`, `_get_cwd_override() -> cwd|None`,
+   - `/project <path>` — **set a sticky override**. Subsequent plain messages target it.
+   - `/project <path> <prompt>` — **one-shot**: deliver `<prompt>` to `<path>` *now*
+     (write straight to the inbox with that cwd), **without** changing the sticky
+     override. Lets the user fire a single instruction at another project without
+     leaving their current default.
+   - `/project clear` / `/project off` — drop the sticky override; revert to
+     `_last_active_cwd`. (`clear`/`off` are reserved path tokens.)
+
+   The sticky override is persisted to `telegram-hook/cwd_override` so it survives a
+   proxy recycle; loaded on `configure()`. Note the precedence (resolution step 2):
+   **a native reply still wins over the sticky override**, so replying to a specific
+   project's notification always goes to that project. `/project` applies to `resume`
+   mode; in `inject` mode it is accepted and shown but only affects delivery once
+   `resume` mode is active.
+   *Unit:* `_parse_project_command(text) -> ("show"|"set"|"oneshot"|"clear", path, prompt)`,
+   `_set_cwd_override(path) -> ok|err`, `_get_cwd_override() -> cwd|None`,
    `_clear_cwd_override()`.
 
 ### Carrier: generalize the monitor loop
@@ -176,9 +191,10 @@ Proxy-level (optional, `plugins.toml`/env): `tick_interval_s` (default 3.0).
 |---|---|
 | `/mute`, `/mute_on`, `/mute_off` | existing — toggle notifications |
 | `/mode auto-approve\|ask\|auto-deny` | existing — approval gate mode |
-| `/cwd <path>` | **new** — set sticky target-project override (validated dir on proxy host) |
-| `/cwd` | **new** — show effective target + override state + recently-seen cwds |
-| `/cwd clear` \| `/cwd off` | **new** — clear override, revert to last-active |
+| `/project <path>` | **new** — set sticky target-project override (validated dir on proxy host) |
+| `/project <path> <prompt>` | **new** — one-shot: deliver `<prompt>` to `<path>` now, sticky override unchanged |
+| `/project` | **new** — show effective target + override state + recently-seen cwds |
+| `/project clear` \| `/project off` | **new** — clear override, revert to last-active |
 
 Any non-command text continues to be forwarded to the session (inject or resume per
 `delivery_mode`).
@@ -190,8 +206,8 @@ Any non-command text continues to be forwarded to the session (inject or resume 
 | `claude_bin` not found | error posted to Telegram once per item; item → `failed/` after retries |
 | headless run times out | killed at `resume_timeout`; retried up to `resume_max_attempts` |
 | target cwd unresolved | fall back to `inject` queue; user told it lands on next request |
-| `/cwd <path>` not a dir on proxy host | rejected with Telegram error; override unchanged |
-| `/cwd` override set to a dir later deleted | delivery item → `failed/`; user told to `/cwd clear` or set a valid path |
+| `/project <path>` not a dir on proxy host | rejected with Telegram error; state unchanged |
+| `/project` override set to a dir later deleted | delivery item → `failed/`; user told to `/project clear` or set a valid path |
 | cwd no longer exists | item → `failed/` with a clear Telegram error |
 | proxy recycles mid-delivery | item remains in inbox (not completed); redelivered after restart |
 | `on_tick` plugin raises | caught in loop; logged; loop and recycle unaffected |
@@ -202,12 +218,16 @@ Any non-command text continues to be forwarded to the session (inject or resume 
 
 Unit (pure, no network/subprocess):
 - registry: record/resolve, FIFO eviction at cap, last-active tracking
-- target resolution precedence: native-reply > `/cwd` override > last-active;
+- target resolution precedence: native-reply > `/project` sticky override > last-active;
   unresolved → inject fallback
-- `/cwd` command: set valid dir succeeds + persists; set non-existent dir rejected,
-  override unchanged; `/cwd clear` reverts to last-active; `/cwd` no-arg reports state;
+- `/project` parsing: `_parse_project_command` classifies show / set / oneshot / clear;
+  `clear`/`off` reserved; quoted paths with spaces parsed intact
+- `/project <path>` set: valid dir succeeds + persists; non-existent dir rejected, state
+  unchanged; `/project clear` reverts to last-active; `/project` no-arg reports state;
   override loaded from `cwd_override` file on configure()
-- `/cwd` path normalization: `~/x`, `$HOME/x`, and relative paths expand to the same
+- `/project <path> <prompt>` one-shot: writes an inbox item with that cwd + prompt and
+  does **not** change the sticky override
+- `/project` path normalization: `~/x`, `$HOME/x`, and relative paths expand to the same
   absolute resolved dir and validate; stored value is the absolute path
 - inbox: put/list/complete/fail round-trips; `failed/` move; malformed file skipped
 - `on_tick`: drains pending items; per-cwd in-flight guard prevents double-spawn;
