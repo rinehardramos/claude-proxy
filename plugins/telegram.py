@@ -1244,6 +1244,46 @@ def _start_poller() -> None:
     _poller_thread.start()
 
 
+# ── Session delivery inbox ───────────────────────────────────────────────
+
+_INBOX_DIR = HOOK_DIR / "session-inbox"
+_INBOX_FAILED_DIR = _INBOX_DIR / "failed"
+
+
+def _inbox_put(text: str, cwd: str) -> Path:
+    """Write a delivery item to the durable inbox. Returns its path."""
+    _INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    path = _INBOX_DIR / f"{time.time_ns()}.json"
+    path.write_text(json.dumps({
+        "text": text, "cwd": cwd, "received_at": time.time(), "attempts": 0,
+    }))
+    return path
+
+
+def _inbox_list() -> list[Path]:
+    if not _INBOX_DIR.exists():
+        return []
+    return sorted(p for p in _INBOX_DIR.iterdir() if p.suffix == ".json")
+
+
+def _inbox_complete(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _inbox_fail(path: Path) -> None:
+    try:
+        _INBOX_FAILED_DIR.mkdir(parents=True, exist_ok=True)
+        path.rename(_INBOX_FAILED_DIR / path.name)
+    except OSError:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────
 
 def _log(msg: str) -> None:

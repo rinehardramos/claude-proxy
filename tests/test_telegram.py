@@ -1342,5 +1342,48 @@ class TestParseProjectCommand(unittest.TestCase):
         self.assertEqual(prompt, "do it")
 
 
+class TestInbox(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.t.HOOK_DIR = Path(self.tmp)
+        self.t._INBOX_DIR = Path(self.tmp) / "session-inbox"
+        self.t._INBOX_FAILED_DIR = self.t._INBOX_DIR / "failed"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_put_creates_item(self):
+        p = self.t._inbox_put("hello", "/home/u/p")
+        self.assertTrue(p.exists())
+        info = json.loads(p.read_text())
+        self.assertEqual(info["text"], "hello")
+        self.assertEqual(info["cwd"], "/home/u/p")
+        self.assertEqual(info["attempts"], 0)
+
+    def test_list_returns_items_sorted(self):
+        a = self.t._inbox_put("1", "/p")
+        b = self.t._inbox_put("2", "/p")
+        listed = self.t._inbox_list()
+        self.assertEqual(listed, sorted([a, b]))
+
+    def test_complete_removes_item(self):
+        p = self.t._inbox_put("x", "/p")
+        self.t._inbox_complete(p)
+        self.assertFalse(p.exists())
+
+    def test_fail_moves_to_failed_dir(self):
+        p = self.t._inbox_put("x", "/p")
+        self.t._inbox_fail(p)
+        self.assertFalse(p.exists())
+        moved = self.t._INBOX_FAILED_DIR / p.name
+        self.assertTrue(moved.exists())
+
+    def test_list_empty_when_no_dir(self):
+        self.assertEqual(self.t._inbox_list(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
