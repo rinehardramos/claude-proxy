@@ -640,6 +640,35 @@ def _md_to_tg_html(text: str) -> str:
 
 # ── Message splitting ─────────────────────────────────────────────────────
 
+def _safe_cut(text: str, limit: int) -> int:
+    """Largest cut index <= limit that doesn't split an HTML entity, tag, or <pre>.
+
+    Slicing already-escaped HTML at a fixed char count can land inside an entity
+    (``&amp;`` → ``&am`` + ``p;``) or a tag, which Telegram rejects as malformed
+    HTML. This backs the cut off to a safe boundary. Falls back to ``limit`` for
+    a degenerate oversized token so the caller always makes progress.
+    """
+    if limit >= len(text):
+        return len(text)
+    cut = limit
+    # not inside a tag: an unclosed '<' before cut
+    lt, gt = text.rfind("<", 0, cut), text.rfind(">", 0, cut)
+    if lt > gt:
+        cut = lt
+    # not inside an entity: an unclosed '&' within ~10 chars before cut
+    amp, semi = text.rfind("&", 0, cut), text.rfind(";", 0, cut)
+    if amp > semi and (cut - amp) <= 10:
+        cut = min(cut, amp)
+    # not inside a <pre> block: opens exceed closes → back to last </pre> end
+    if text.count("<pre>", 0, cut) > text.count("</pre>", 0, cut):
+        close = text.rfind("</pre>", 0, cut)
+        if close != -1:
+            cut = close + len("</pre>")
+    if cut <= 0:
+        cut = limit
+    return cut
+
+
 def _split_message(
     response: str,
     project: str,
@@ -650,6 +679,8 @@ def _split_message(
 
     First chunk:  bold header + blockquote response
     Subsequent:   bold project [i/N] + blockquote continuation
+    Cuts at HTML-safe boundaries (see _safe_cut) so chunks never contain
+    malformed HTML that Telegram rejects with a 400.
     """
     esc_project = _esc(project)
     esc_prompt = _esc(user_text)
@@ -668,16 +699,20 @@ def _split_message(
     if first_body_max >= len(esc_response):
         return [f"{first_header}{bq_open}{esc_response}{bq_close}"]
 
-    # Pre-scan to figure out total chunk count
+    # Pre-scan to figure out total chunk count. Cut at HTML-safe boundaries so a
+    # chunk never ends inside an entity (&amp;) or tag (<pre>) — Telegram rejects
+    # malformed HTML with parse_mode=HTML (400 Bad Request).
     raw_chunks: list[str] = []
     rest = esc_response
-    raw_chunks.append(rest[:first_body_max])
-    rest = rest[first_body_max:]
+    cut = _safe_cut(rest, first_body_max)
+    raw_chunks.append(rest[:cut])
+    rest = rest[cut:]
     cont_header_template = f"<b>{esc_project} [00/00]</b>\n"
     cont_body_max = MAX_TG_LENGTH - len(cont_header_template) - bq_overhead
     while rest:
-        raw_chunks.append(rest[:cont_body_max])
-        rest = rest[cont_body_max:]
+        cut = _safe_cut(rest, cont_body_max)
+        raw_chunks.append(rest[:cut])
+        rest = rest[cut:]
 
     total = len(raw_chunks)
     result = [f"{first_header}{bq_open}{raw_chunks[0]}{bq_close}"]
