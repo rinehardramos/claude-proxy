@@ -1520,5 +1520,76 @@ class TestPlainMessageRouting(unittest.TestCase):
         self.assertEqual(self.t._inbox_list(), [])
 
 
+class TestDeliverer(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.t.HOOK_DIR = Path(self.tmp)
+        self.t._INBOX_DIR = Path(self.tmp) / "session-inbox"
+        self.t._INBOX_FAILED_DIR = self.t._INBOX_DIR / "failed"
+        self.t._claude_bin = "claude"
+        self.t._resume_timeout = 30
+        self.t._resume_max_attempts = 3
+        self.t._delivery_mode = "resume"
+        # target cwd must exist
+        self.cwd = str(Path(self.tmp).resolve())
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_deliver_success_completes_item(self):
+        p = self.t._inbox_put("do it", self.cwd)
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")) as m:
+            self.t._deliver_one(p)
+        self.assertFalse(p.exists())  # completed
+        args = m.call_args[0][0]
+        self.assertEqual(args[0], "claude")
+        self.assertIn("--continue", args)
+        self.assertIn("--print", args)
+        self.assertEqual(self.t._INBOX_FAILED_DIR.exists() and
+                         list(self.t._INBOX_FAILED_DIR.iterdir()) or [], [])
+
+    def test_deliver_runs_in_target_cwd(self):
+        p = self.t._inbox_put("x", self.cwd)
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")) as m:
+            self.t._deliver_one(p)
+        self.assertEqual(m.call_args.kwargs["cwd"], self.cwd)
+
+    def test_deliver_failure_increments_attempts(self):
+        p = self.t._inbox_put("x", self.cwd)
+        with patch("subprocess.run", return_value=MagicMock(returncode=1, stderr="boom")):
+            self.t._deliver_one(p)
+        self.assertTrue(p.exists())  # not completed
+        self.assertEqual(json.loads(p.read_text())["attempts"], 1)
+
+    def test_deliver_gives_up_after_max_attempts(self):
+        p = self.t._inbox_put("x", self.cwd)
+        # pre-set attempts to max-1 so this run trips the limit
+        info = json.loads(p.read_text()); info["attempts"] = 2; p.write_text(json.dumps(info))
+        with patch("subprocess.run", return_value=MagicMock(returncode=1, stderr="boom")), \
+             patch.object(self.t, "_send_message"):
+            self.t._deliver_one(p)
+        self.assertFalse(p.exists())
+        self.assertTrue((self.t._INBOX_FAILED_DIR / p.name).exists())
+
+    def test_deliver_missing_cwd_fails_fast(self):
+        p = self.t._inbox_put("x", self.tmp + "/gone")
+        with patch.object(self.t, "_send_message"):
+            self.t._deliver_one(p)
+        self.assertTrue((self.t._INBOX_FAILED_DIR / p.name).exists())
+
+    def test_on_tick_drains_inbox(self):
+        self.t._inbox_put("a", self.cwd)
+        # make delivery synchronous by patching the worker thread to run inline
+        with patch.object(self.t.threading, "Thread") as MockThread, \
+             patch.object(self.t, "_deliver_one") as mock_deliver:
+            MockThread.side_effect = lambda target, daemon=None: \
+                type("T", (), {"start": lambda s: target()})()
+            self.t.on_tick(0.0)
+        mock_deliver.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

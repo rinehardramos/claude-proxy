@@ -1347,6 +1347,95 @@ def _inbox_fail(path: Path) -> None:
             pass
 
 
+# ── Session deliverer (resume mode) ──────────────────────────────────────
+
+_inflight_lock = threading.Lock()
+_inflight_cwds: set[str] = set()
+
+
+def _deliver_one(item_path: Path) -> None:
+    """Deliver one inbox item via `claude --continue --print` in its cwd."""
+    try:
+        info = json.loads(item_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        _inbox_fail(item_path)
+        return
+
+    cwd = info.get("cwd", "")
+    text = info.get("text", "")
+    attempts = int(info.get("attempts", 0))
+
+    if not cwd or not Path(cwd).is_dir():
+        _inbox_fail(item_path)
+        _send_message(
+            f"⚠ Cannot deliver to {cwd or '(unknown)'}: not a directory. "
+            f"Use /project clear or set a valid path."
+        )
+        return
+
+    err = ""
+    try:
+        proc = subprocess.run(
+            [_claude_bin, "--continue", "--print", text],
+            cwd=cwd, capture_output=True, text=True, timeout=_resume_timeout,
+        )
+        if proc.returncode == 0:
+            _inbox_complete(item_path)
+            _log(f"delivered to {cwd} ({len(text)} chars)")
+            return
+        err = (proc.stderr or "").strip()[:300]
+    except FileNotFoundError:
+        err = f"claude binary not found: {_claude_bin}"
+    except subprocess.TimeoutExpired:
+        err = f"timed out after {_resume_timeout}s"
+    except Exception as exc:  # noqa: BLE001 — report any spawn failure
+        err = str(exc)
+
+    attempts += 1
+    info["attempts"] = attempts
+    try:
+        item_path.write_text(json.dumps(info))
+    except OSError:
+        pass
+
+    if attempts >= _resume_max_attempts:
+        _inbox_fail(item_path)
+        _send_message(f"⚠ Delivery to {cwd} failed after {attempts} attempts: {err}")
+    else:
+        _log(f"delivery attempt {attempts} to {cwd} failed: {err}")
+
+
+def on_tick(now: float) -> None:
+    """Called periodically by the proxy's supervised monitor loop.
+
+    Drains the delivery inbox, spawning `claude --continue` per item with a
+    per-cwd in-flight guard so a slow delivery does not pile up across ticks.
+    (Poller watchdog is added in a later task.)
+    """
+    if _delivery_mode != "resume":
+        return
+    for item_path in _inbox_list():
+        try:
+            info = json.loads(item_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            _inbox_fail(item_path)
+            continue
+        cwd = info.get("cwd", "")
+        with _inflight_lock:
+            if cwd in _inflight_cwds:
+                continue
+            _inflight_cwds.add(cwd)
+
+        def _run(p=item_path, c=cwd):
+            try:
+                _deliver_one(p)
+            finally:
+                with _inflight_lock:
+                    _inflight_cwds.discard(c)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────
 
 def _log(msg: str) -> None:
