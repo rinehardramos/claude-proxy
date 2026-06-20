@@ -944,10 +944,14 @@ def _handle_text_message(msg: dict, token: str, chat_id: str) -> None:
     # is queued for on_outbound() to inject into the session's next request.
     target = _resolve_target(msg)
     if _delivery_mode == "resume" and target:
-        _inbox_put(text, target)
-        _send_text(token, chat_id, f"\u2705 Sent to {os.path.basename(target)}")
-        _log(f"message \u2192 inbox for {target} ({len(text)} chars)")
-        return
+        try:
+            _inbox_put(text, target)
+        except OSError as exc:
+            _log(f"inbox write failed ({exc}); falling back to inject queue")
+        else:
+            _send_text(token, chat_id, f"\u2705 Sent to {os.path.basename(target)}")
+            _log(f"message \u2192 inbox for {target} ({len(text)} chars)")
+            return
     with _pending_replies_lock:
         _pending_replies.append(text)
     _send_text(token, chat_id, "\u2705 Sent to session")

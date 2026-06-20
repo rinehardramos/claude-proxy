@@ -1509,6 +1509,16 @@ class TestPlainMessageRouting(unittest.TestCase):
         self.assertEqual(self.t._pending_replies, ["hello"])
         self.assertEqual(self.t._inbox_list(), [])
 
+    def test_resume_mode_inbox_failure_falls_back_to_queue(self):
+        self.t._delivery_mode = "resume"
+        self.t._last_active_cwd = "/home/u/projY"
+        with patch("urllib.request.urlopen"), \
+             patch.object(self.t, "_inbox_put", side_effect=OSError("disk full")):
+            self.t._handle_text_message({"text": "important msg"}, "tok", "chat")
+        # message must NOT be lost — it falls back to the inject queue
+        self.assertEqual(self.t._pending_replies, ["important msg"])
+        self.assertEqual(self.t._inbox_list(), [])
+
 
 if __name__ == "__main__":
     unittest.main()
