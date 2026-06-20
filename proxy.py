@@ -1169,7 +1169,19 @@ def main():
                     print(f"[monitor] telegram notify failed: {exc}", file=sys.stderr, flush=True)
         os._exit(75)
 
-    resource_monitor.start(on_recycle=_on_recycle, interval_s=60.0)
+    def _on_tick(now):
+        for p in plugin_mgr.plugins:
+            tick = getattr(p, "on_tick", None)
+            if callable(tick):
+                try:
+                    tick(now)
+                except Exception as exc:
+                    print(f"[monitor] plugin on_tick failed: {exc}", file=sys.stderr, flush=True)
+
+    resource_monitor.start(
+        on_recycle=_on_recycle, interval_s=60.0,
+        on_tick=_on_tick, tick_interval_s=3.0,
+    )
 
     # Clean up PID file on exit — but only if it still points to us.
     # This prevents a crashing child from deleting a healthy instance's PID.

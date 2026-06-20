@@ -163,3 +163,44 @@ def test_monitor_double_start_raises():
             mon.start(on_recycle=lambda b: None, interval_s=60.0)
     finally:
         mon.stop()
+
+
+# A metrics dict that never breaches the default Thresholds.
+_SAFE_METRICS = {"rss_mb": 1, "threads": 1, "fds": 1, "fd_limit": 1000}
+
+
+def test_monitor_fires_on_tick_each_interval():
+    import threading as _th
+    from monitor import ResourceMonitor
+    mon = ResourceMonitor(metrics_source=lambda: dict(_SAFE_METRICS))
+    ticks = []
+    ev = _th.Event()
+
+    def on_tick(now):
+        ticks.append(now)
+        if len(ticks) >= 2:
+            ev.set()
+
+    mon.start(on_recycle=lambda b: None, interval_s=60.0,
+              on_tick=on_tick, tick_interval_s=0.01)
+    assert ev.wait(timeout=2.0), "on_tick not fired at least twice"
+    mon.stop()
+
+
+def test_on_tick_exception_does_not_kill_loop():
+    import threading as _th
+    from monitor import ResourceMonitor
+    mon = ResourceMonitor(metrics_source=lambda: dict(_SAFE_METRICS))
+    count = {"n": 0}
+    ev = _th.Event()
+
+    def on_tick(now):
+        count["n"] += 1
+        if count["n"] == 1:
+            raise RuntimeError("boom")
+        ev.set()
+
+    mon.start(on_recycle=lambda b: None, interval_s=60.0,
+              on_tick=on_tick, tick_interval_s=0.01)
+    assert ev.wait(timeout=2.0), "loop died after on_tick raised"
+    mon.stop()
