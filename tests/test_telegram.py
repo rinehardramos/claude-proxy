@@ -1209,5 +1209,41 @@ def test_telegram_recycle_opt_out(monkeypatch):
     assert sent == []
 
 
+class TestMessageRegistry(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+
+    def test_record_and_resolve(self):
+        self.t._record_message_target(42, "/home/u/proj")
+        self.assertEqual(self.t._cwd_for_message(42), "/home/u/proj")
+
+    def test_record_updates_last_active(self):
+        self.t._record_message_target(1, "/home/u/a")
+        self.assertEqual(self.t._last_active_cwd, "/home/u/a")
+
+    def test_resolve_unknown_returns_none(self):
+        self.assertIsNone(self.t._cwd_for_message(999))
+
+    def test_none_message_id_ignored_but_sets_last_active(self):
+        self.t._record_message_target(None, "/home/u/b")
+        self.assertEqual(self.t._last_active_cwd, "/home/u/b")
+        self.assertIsNone(self.t._cwd_for_message(None))
+
+    def test_fifo_eviction_at_cap(self):
+        self.t._MSG_CWD_CAP = 3
+        for i in range(5):
+            self.t._record_message_target(i, f"/p/{i}")
+        # Oldest (0, 1) evicted; newest kept
+        self.assertIsNone(self.t._cwd_for_message(0))
+        self.assertIsNone(self.t._cwd_for_message(1))
+        self.assertEqual(self.t._cwd_for_message(4), "/p/4")
+
+    def test_recent_cwds_most_recent_first_deduped(self):
+        self.t._record_message_target(1, "/p/a")
+        self.t._record_message_target(2, "/p/b")
+        self.t._record_message_target(3, "/p/a")
+        self.assertEqual(self.t._recent_cwds(), ["/p/a", "/p/b"])
+
+
 if __name__ == "__main__":
     unittest.main()

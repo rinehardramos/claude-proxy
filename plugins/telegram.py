@@ -17,6 +17,7 @@ import threading
 import time
 import urllib.request
 import uuid
+from collections import OrderedDict
 from html import escape as _esc
 
 from pathlib import Path
@@ -38,6 +39,47 @@ _resume_max_attempts: int = 3
 _last_active_cwd: str | None = None
 
 MAX_TG_LENGTH = 4096
+
+# ── Project-tag registry (message_id → cwd) ──────────────────────────────
+
+_msg_cwd_lock = threading.Lock()
+_msg_cwd: "OrderedDict[int, str]" = OrderedDict()
+_MSG_CWD_CAP = 500
+
+
+def _record_message_target(message_id: int | None, cwd: str) -> None:
+    """Record which project cwd a sent Telegram message belongs to."""
+    global _last_active_cwd
+    if cwd:
+        _last_active_cwd = cwd
+    if not message_id or not cwd:
+        return
+    with _msg_cwd_lock:
+        _msg_cwd[message_id] = cwd
+        _msg_cwd.move_to_end(message_id)
+        while len(_msg_cwd) > _MSG_CWD_CAP:
+            _msg_cwd.popitem(last=False)
+
+
+def _cwd_for_message(message_id: int | None) -> str | None:
+    if not message_id:
+        return None
+    with _msg_cwd_lock:
+        return _msg_cwd.get(message_id)
+
+
+def _recent_cwds(limit: int = 10) -> list[str]:
+    """Distinct cwds, most-recently-recorded first."""
+    seen: list[str] = []
+    with _msg_cwd_lock:
+        for cwd in reversed(list(_msg_cwd.values())):
+            if cwd not in seen:
+                seen.append(cwd)
+            if len(seen) >= limit:
+                break
+    return seen
+
+
 MAX_TG_CAPTION = 1024
 
 # ── Callback poller state ────────────────────────────────────────────────
