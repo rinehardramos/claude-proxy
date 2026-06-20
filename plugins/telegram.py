@@ -929,15 +929,6 @@ def _handle_text_message(msg: dict, token: str, chat_id: str) -> None:
         _log(f"reply queued ({len(text)} chars)")
         return
 
-    # Reply-to-message: user used Telegram's native reply on a bot message
-    reply_to = msg.get("reply_to_message", {})
-    if reply_to.get("from", {}).get("is_bot"):
-        with _pending_replies_lock:
-            _pending_replies.append(text)
-        _send_text(token, chat_id, "\u2705 Reply queued")
-        _log(f"reply-to queued ({len(text)} chars)")
-        return
-
     # Fallback: any other plain message is forwarded to the running session.
     # In "resume" mode it is delivered to the resolved project via the inbox
     # (wakes idle sessions). In "inject" mode (or when no target is known) it
@@ -1375,9 +1366,12 @@ def _deliver_one(item_path: Path) -> None:
 
     err = ""
     try:
+        env = os.environ.copy()
+        env.setdefault("ANTHROPIC_BASE_URL", "http://127.0.0.1:18019")
         proc = subprocess.run(
             [_claude_bin, "--continue", "--print", text],
             cwd=cwd, capture_output=True, text=True, timeout=_resume_timeout,
+            env=env,
         )
         if proc.returncode == 0:
             _inbox_complete(item_path)

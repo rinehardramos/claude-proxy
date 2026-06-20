@@ -1519,6 +1519,20 @@ class TestPlainMessageRouting(unittest.TestCase):
         self.assertEqual(self.t._pending_replies, ["important msg"])
         self.assertEqual(self.t._inbox_list(), [])
 
+    def test_resume_mode_native_reply_routes_to_replied_project(self):
+        self.t._delivery_mode = "resume"
+        # registry maps the replied-to message_id -> a project cwd
+        self.t._record_message_target(555, "/home/u/projReply")
+        self.t._last_active_cwd = "/home/u/other"  # must NOT be chosen
+        msg = {"text": "fix it", "reply_to_message": {"from": {"is_bot": True}, "message_id": 555}}
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message(msg, "tok", "chat")
+        items = self.t._inbox_list()
+        self.assertEqual(len(items), 1)
+        info = json.loads(items[0].read_text())
+        self.assertEqual(info["text"], "fix it")
+        self.assertEqual(info["cwd"], "/home/u/projReply")  # registry cwd wins, not last-active
+
 
 class TestDeliverer(unittest.TestCase):
     def setUp(self):
@@ -1598,6 +1612,13 @@ class TestDeliverer(unittest.TestCase):
             inst.start.side_effect = RuntimeError("can't start thread")
             self.t.on_tick(0.0)
         self.assertNotIn(self.cwd, self.t._inflight_cwds)
+
+    def test_deliver_sets_anthropic_base_url(self):
+        p = self.t._inbox_put("x", self.cwd)
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")) as m:
+            self.t._deliver_one(p)
+        env = m.call_args.kwargs["env"]
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:18019")
 
 
 class TestPollerWatchdog(unittest.TestCase):
