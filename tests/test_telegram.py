@@ -474,6 +474,38 @@ class TestSplitMessage(unittest.TestCase):
         chunks = self.t._split_message("body", "proj", "q")
         self.assertNotIn("Audio unavailable", chunks[0])
 
+    def test_split_does_not_break_html_entities(self):
+        """A chunk boundary must not fall inside an HTML entity (causes TG 400)."""
+        import re
+        resp = "a < b & c > d " * 700  # escapes to &lt; &amp; &gt; ; forces a split
+        chunks = self.t._split_message(resp, "proj", "q")
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            body = re.findall(r"<blockquote>(.*?)</blockquote>", c, re.DOTALL)[-1]
+            # no chunk body ends with a truncated entity like '&am'
+            self.assertIsNone(
+                re.search(r"&[a-zA-Z#0-9]{0,9}$", body),
+                f"chunk ends mid-entity: {body[-12:]!r}")
+            # tags balanced within each chunk
+            self.assertEqual(c.count("<blockquote>"), c.count("</blockquote>"))
+            self.assertEqual(c.count("<pre>"), c.count("</pre>"))
+
+    def test_split_keeps_pre_blocks_intact(self):
+        """A <pre> table block must not be split across chunks (unbalanced tags → 400)."""
+        table = "| col1 | col2 |\n|---|---|\n| aaaa | bbbb |\n"
+        resp = ("x " * 2400) + table + ("y " * 2400)
+        chunks = self.t._split_message(resp, "proj", "q")
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertEqual(c.count("<pre>"), c.count("</pre>"),
+                             "<pre> block split across chunks")
+
+    def test_safe_cut_backs_off_entity(self):
+        self.assertEqual(self.t._safe_cut("abc&amp;def", 5), 3)  # cut before '&'
+
+    def test_safe_cut_full_when_within_limit(self):
+        self.assertEqual(self.t._safe_cut("short", 100), 5)
+
 
 # ── on_inbound integration ───────────────────────────────────────────────
 
@@ -1642,6 +1674,14 @@ class TestDeliverer(unittest.TestCase):
             self.t._deliver_one(p)
         env = m.call_args.kwargs["env"]
         self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:18019")
+
+    def test_deliver_passes_devnull_stdin(self):
+        """claude --print waits ~3s for stdin; pass DEVNULL so it never stalls."""
+        import subprocess as _sp
+        p = self.t._inbox_put("x", self.cwd)
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")) as m:
+            self.t._deliver_one(p)
+        self.assertEqual(m.call_args.kwargs.get("stdin"), _sp.DEVNULL)
 
 
 class TestPollerWatchdog(unittest.TestCase):
