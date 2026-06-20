@@ -1410,8 +1410,14 @@ def on_tick(now: float) -> None:
 
     Drains the delivery inbox, spawning `claude --continue` per item with a
     per-cwd in-flight guard so a slow delivery does not pile up across ticks.
-    (Poller watchdog is added in a later task.)
+    Also watches the long-poll thread and respawns it if it has died.
     """
+    # Poller watchdog: respawn the long-poll thread if it has died.
+    if _bot_token and _chat_id:
+        if _poller_thread is None or not _poller_thread.is_alive():
+            _log("poller thread not alive — respawning")
+            _start_poller()
+
     if _delivery_mode != "resume":
         return
     for item_path in _inbox_list():

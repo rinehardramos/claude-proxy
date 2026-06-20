@@ -1600,5 +1600,35 @@ class TestDeliverer(unittest.TestCase):
         self.assertNotIn(self.cwd, self.t._inflight_cwds)
 
 
+class TestPollerWatchdog(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+        self.t._bot_token = "tok"
+        self.t._chat_id = "chat"
+        self.t._delivery_mode = "inject"  # so the drain part is skipped
+
+    def test_respawns_dead_poller(self):
+        self.t._poller_thread = None
+        with patch.object(self.t, "_start_poller") as mock_start:
+            self.t.on_tick(0.0)
+        mock_start.assert_called_once()
+
+    def test_does_not_respawn_live_poller(self):
+        class FakeThread:
+            def is_alive(self):
+                return True
+        self.t._poller_thread = FakeThread()
+        with patch.object(self.t, "_start_poller") as mock_start:
+            self.t.on_tick(0.0)
+        mock_start.assert_not_called()
+
+    def test_no_respawn_without_credentials(self):
+        self.t._bot_token = None
+        self.t._poller_thread = None
+        with patch.object(self.t, "_start_poller") as mock_start:
+            self.t.on_tick(0.0)
+        mock_start.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
