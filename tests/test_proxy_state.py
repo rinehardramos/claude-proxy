@@ -465,12 +465,27 @@ class TestMainLifecycle(unittest.TestCase):
     }
 
     def _patch_main_common(self):
-        """Return a list of started patches for the post-dedup code path."""
+        """Return a list of started patches for the post-dedup code path.
+
+        Mocks PluginManager + monitor.ResourceMonitor so main() never loads the
+        real plugins dir — that would start a live Telegram poller against the
+        real bot credentials, leaking a thread that pollutes other test modules
+        when the whole suite runs in one process.
+        """
         patches = []
         for attr, rv in self._COMMON_PATCHES.items():
             p = patch.object(_proxy_mod, attr, return_value=rv)
             p.start()
             patches.append(p)
+        mock_mgr = MagicMock()
+        mock_mgr.plugins = []
+        mock_mgr.reload_count = 0
+        pm = patch.object(_proxy_mod, "PluginManager", return_value=mock_mgr)
+        pm.start()
+        patches.append(pm)
+        rm = patch("monitor.ResourceMonitor")
+        rm.start()
+        patches.append(rm)
         return patches
 
     def test_dedup_exits_0_when_running(self):
