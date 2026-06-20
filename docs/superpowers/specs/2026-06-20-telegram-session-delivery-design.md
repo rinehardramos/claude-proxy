@@ -84,11 +84,14 @@ on_inbound() (existing) ──▶ Claude's answer posted to Telegram
    *Unit:* `_record_message_target(message_id, cwd)` / `_resolve_target(reply_to_id) -> cwd|None`.
 
 2. **Target resolution** (in `_handle_text_message` and the reply/option callbacks).
-   - native reply (`reply_to_message.message_id`) → registry lookup → cwd
-   - option/reply button callback → its message's id → registry → cwd
-   - plain typed message → `_last_active_cwd`
+   Precedence, most specific first:
+   1. native reply (`reply_to_message.message_id`) → registry lookup → cwd
+      (also option/reply button callbacks → their message's id → registry → cwd)
+   2. **`/cwd` override** (if set) → override cwd
+   3. plain typed message with no override → `_last_active_cwd`
    - unresolved → fall back to `inject` behavior (queue in `_pending_replies`) and tell
      the user it'll land on the session's next request.
+   *Unit:* `_resolve_target(msg) -> cwd|None`.
 
 3. **Disk inbox** (`telegram-hook/session-inbox/`).
    In `resume` mode, a resolved message is written as `<time_ns>.json` =
@@ -113,6 +116,22 @@ on_inbound() (existing) ──▶ Claude's answer posted to Telegram
    Check `_poller_thread.is_alive()`; if dead and credentials are present, respawn it
    via `_start_poller()`. This makes the shared supervised tick the watchdog for the
    long-poll thread, closing the "thread silently died" gap.
+
+6. **`/cwd` command — manual project override** (in `_handle_text_message`, alongside
+   `/mute` and `/mode`). Lets the user resume a project other than the last-active one —
+   the escape hatch for the shared-cwd limitation and for projects with no recent
+   notification. Feeds resolution step 2 above.
+   - `/cwd <path>` — set a **sticky** override. Validated: must be an existing directory
+     **on the proxy host** (that is where `claude --continue` runs). Invalid → reject
+     with a clear Telegram error; override unchanged.
+   - `/cwd` (no arg) — show the current effective target and override state, plus the
+     recently-seen cwds from the registry (so the user knows valid options).
+   - `/cwd clear` / `/cwd off` — drop the override; revert to `_last_active_cwd`.
+   Persisted to `telegram-hook/cwd_override` so it survives a proxy recycle; loaded on
+   `configure()`. Override applies to `resume` mode; in `inject` mode it is accepted and
+   shown but only affects behavior once `resume` mode is active.
+   *Unit:* `_set_cwd_override(path) -> ok|err`, `_get_cwd_override() -> cwd|None`,
+   `_clear_cwd_override()`.
 
 ### Carrier: generalize the monitor loop
 
@@ -146,6 +165,19 @@ resume_max_attempts = 3
 
 Proxy-level (optional, `plugins.toml`/env): `tick_interval_s` (default 3.0).
 
+### Telegram commands (handled in `_handle_text_message`)
+
+| Command | Effect |
+|---|---|
+| `/mute`, `/mute_on`, `/mute_off` | existing — toggle notifications |
+| `/mode auto-approve\|ask\|auto-deny` | existing — approval gate mode |
+| `/cwd <path>` | **new** — set sticky target-project override (validated dir on proxy host) |
+| `/cwd` | **new** — show effective target + override state + recently-seen cwds |
+| `/cwd clear` \| `/cwd off` | **new** — clear override, revert to last-active |
+
+Any non-command text continues to be forwarded to the session (inject or resume per
+`delivery_mode`).
+
 ## Error handling
 
 | Failure | Behavior |
@@ -153,6 +185,8 @@ Proxy-level (optional, `plugins.toml`/env): `tick_interval_s` (default 3.0).
 | `claude_bin` not found | error posted to Telegram once per item; item → `failed/` after retries |
 | headless run times out | killed at `resume_timeout`; retried up to `resume_max_attempts` |
 | target cwd unresolved | fall back to `inject` queue; user told it lands on next request |
+| `/cwd <path>` not a dir on proxy host | rejected with Telegram error; override unchanged |
+| `/cwd` override set to a dir later deleted | delivery item → `failed/`; user told to `/cwd clear` or set a valid path |
 | cwd no longer exists | item → `failed/` with a clear Telegram error |
 | proxy recycles mid-delivery | item remains in inbox (not completed); redelivered after restart |
 | `on_tick` plugin raises | caught in loop; logged; loop and recycle unaffected |
@@ -163,7 +197,11 @@ Proxy-level (optional, `plugins.toml`/env): `tick_interval_s` (default 3.0).
 
 Unit (pure, no network/subprocess):
 - registry: record/resolve, FIFO eviction at cap, last-active tracking
-- target resolution: native-reply → cwd; plain → last-active; unresolved → inject fallback
+- target resolution precedence: native-reply > `/cwd` override > last-active;
+  unresolved → inject fallback
+- `/cwd` command: set valid dir succeeds + persists; set non-existent dir rejected,
+  override unchanged; `/cwd clear` reverts to last-active; `/cwd` no-arg reports state;
+  override loaded from `cwd_override` file on configure()
 - inbox: put/list/complete/fail round-trips; `failed/` move; malformed file skipped
 - `on_tick`: drains pending items; per-cwd in-flight guard prevents double-spawn;
   increments attempts on failure; moves to `failed/` after max; respawns dead poller
