@@ -31,6 +31,11 @@ _tts_openai_model: str = "tts-1"
 _tts_openai_voice: str = "alloy"
 _tts_openai_api_key: str | None = None
 _voice_upload_timeout: int = 300
+_delivery_mode: str = "inject"   # "inject" | "resume"
+_claude_bin: str = "claude"
+_resume_timeout: int = 300
+_resume_max_attempts: int = 3
+_last_active_cwd: str | None = None
 
 MAX_TG_LENGTH = 4096
 MAX_TG_CAPTION = 1024
@@ -241,6 +246,7 @@ def configure(config: dict) -> None:
     global _audio_threshold, _tts_engine, _voice_upload_timeout
     global _tts_openai_model, _tts_openai_voice, _tts_openai_api_key
     global _notify_on_recycle
+    global _delivery_mode, _claude_bin, _resume_timeout, _resume_max_attempts
 
     _project_name = config.get("project_name", "")  # explicit override only; dynamic cwd used at runtime
     _audio_threshold = int(config.get("audio_threshold", 8192))
@@ -254,6 +260,11 @@ def configure(config: dict) -> None:
     _tts_openai_api_key = config.get("tts_openai_api_key") or os.environ.get(api_key_env)
 
     _notify_on_recycle = bool(config.get("notify_on_recycle", True))
+
+    _delivery_mode = config.get("delivery_mode", "inject")
+    _claude_bin = config.get("claude_bin", "claude")
+    _resume_timeout = int(config.get("resume_timeout", 300))
+    _resume_max_attempts = int(config.get("resume_max_attempts", 3))
 
     # Credentials
     _bot_token = config.get("bot_token")

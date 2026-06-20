@@ -187,6 +187,33 @@ class TestConfigure(unittest.TestCase):
             self.t.configure({"tts_openai_api_key_env": "MY_OAI_KEY"})
         self.assertEqual(self.t._tts_openai_api_key, "sk-custom")
 
+    def test_reads_delivery_config_defaults(self):
+        env = self._clean_env()
+        env["TELEGRAM_BOT_TOKEN"] = "tok"
+        env["TELEGRAM_CHAT_ID"] = "chat"
+        with patch.dict(os.environ, env, clear=True):
+            self.t.configure({})
+        self.assertEqual(self.t._delivery_mode, "inject")
+        self.assertEqual(self.t._claude_bin, "claude")
+        self.assertEqual(self.t._resume_timeout, 300)
+        self.assertEqual(self.t._resume_max_attempts, 3)
+
+    def test_reads_delivery_config_overrides(self):
+        env = self._clean_env()
+        env["TELEGRAM_BOT_TOKEN"] = "tok"
+        env["TELEGRAM_CHAT_ID"] = "chat"
+        with patch.dict(os.environ, env, clear=True):
+            self.t.configure({
+                "delivery_mode": "resume",
+                "claude_bin": "/usr/local/bin/claude",
+                "resume_timeout": 120,
+                "resume_max_attempts": 5,
+            })
+        self.assertEqual(self.t._delivery_mode, "resume")
+        self.assertEqual(self.t._claude_bin, "/usr/local/bin/claude")
+        self.assertEqual(self.t._resume_timeout, 120)
+        self.assertEqual(self.t._resume_max_attempts, 5)
+
 
 # ── Dynamic Timeout ──────────────────────────────────────────────────────
 
