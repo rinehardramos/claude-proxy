@@ -204,3 +204,29 @@ def test_on_tick_exception_does_not_kill_loop():
               on_tick=on_tick, tick_interval_s=0.01)
     assert ev.wait(timeout=2.0), "loop died after on_tick raised"
     mon.stop()
+
+
+def test_recycle_still_fires_on_interval_in_tick_branch():
+    import threading as _th
+    from monitor import ResourceMonitor, Thresholds
+    # rss far above the default threshold → should_recycle returns a breach
+    mon = ResourceMonitor(
+        metrics_source=lambda: {"rss_mb": 10**9, "threads": 1, "fds": 1, "fd_limit": 1000},
+    )
+    fired = _th.Event()
+    mon.start(
+        on_recycle=lambda breach: fired.set(),
+        interval_s=0.05,          # ~5 ticks per eval at tick=0.01
+        on_tick=lambda now: None,
+        tick_interval_s=0.01,
+    )
+    assert fired.wait(timeout=2.0), "recycle eval did not fire in the on_tick branch"
+    mon.stop()
+
+
+def test_start_rejects_zero_tick_interval():
+    import pytest
+    from monitor import ResourceMonitor
+    mon = ResourceMonitor(metrics_source=lambda: {"rss_mb": 1, "threads": 1, "fds": 1, "fd_limit": 1000})
+    with pytest.raises(ValueError):
+        mon.start(on_recycle=lambda b: None, interval_s=60.0, on_tick=lambda now: None, tick_interval_s=0)

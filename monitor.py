@@ -149,6 +149,8 @@ class ResourceMonitor:
               tick_interval_s: float = 3.0) -> None:
         if hasattr(self, "_stop_event") and not self._stop_event.is_set():
             raise RuntimeError("ResourceMonitor is already running; call stop() first")
+        if on_tick is not None and tick_interval_s <= 0:
+            raise ValueError(f"tick_interval_s must be > 0, got {tick_interval_s!r}")
         self._stop_event = threading.Event()
 
         def _eval_recycle():
