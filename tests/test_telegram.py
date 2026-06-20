@@ -853,6 +853,29 @@ class TestCallbackPoller(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
+    def test_get_updates_requests_message_updates(self):
+        """The poller must explicitly request message updates, not just callbacks.
+
+        Telegram persists allowed_updates server-side; if the poller omits it,
+        a stale callback-only filter silently drops all text messages.
+        """
+        captured = {}
+
+        class _Resp:
+            def read(self_inner):
+                return json.dumps({"ok": True, "result": []}).encode()
+
+        def mock_urlopen(url, timeout=None):
+            captured["url"] = url
+            return _Resp()
+
+        with patch.object(urllib.request, "urlopen", side_effect=mock_urlopen):
+            self.t._get_updates("TOK", 5, timeout=30)
+
+        self.assertIn("allowed_updates", captured["url"])
+        self.assertIn("message", captured["url"])
+        self.assertIn("callback_query", captured["url"])
+
     def test_handle_callback_approve(self):
         """Approve callback writes decided file and removes pending."""
         decision_id = "abc123"

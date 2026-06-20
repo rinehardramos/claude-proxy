@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 import uuid
 from collections import OrderedDict
@@ -775,8 +776,17 @@ def _send_voice(token: str, chat_id: str, ogg_path: str, caption: str, timeout: 
 # ── Callback Poller ──────────────────────────────────────────────────────
 
 def _get_updates(token: str, offset: int, timeout: int = 30) -> list[dict]:
-    """Long-poll Telegram getUpdates for new updates."""
-    url = f"https://api.telegram.org/bot{token}/getUpdates?offset={offset}&timeout={timeout}"
+    """Long-poll Telegram getUpdates for new updates.
+
+    allowed_updates is sent explicitly on every call. Telegram persists the
+    last value server-side, so omitting it lets a stale callback-only filter
+    silently drop all text messages — which breaks command/message handling.
+    """
+    allowed = urllib.parse.quote('["message","edited_message","callback_query"]')
+    url = (
+        f"https://api.telegram.org/bot{token}/getUpdates"
+        f"?offset={offset}&timeout={timeout}&allowed_updates={allowed}"
+    )
     resp = urllib.request.urlopen(url, timeout=timeout + 10)
     data = json.loads(resp.read())
     return data.get("result", [])
