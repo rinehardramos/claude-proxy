@@ -1567,7 +1567,7 @@ class TestDeliverer(unittest.TestCase):
     def test_deliver_gives_up_after_max_attempts(self):
         p = self.t._inbox_put("x", self.cwd)
         # pre-set attempts to max-1 so this run trips the limit
-        info = json.loads(p.read_text()); info["attempts"] = 2; p.write_text(json.dumps(info))
+        info = json.loads(p.read_text()); info["attempts"] = self.t._resume_max_attempts - 1; p.write_text(json.dumps(info))
         with patch("subprocess.run", return_value=MagicMock(returncode=1, stderr="boom")), \
              patch.object(self.t, "_send_message"):
             self.t._deliver_one(p)
@@ -1589,6 +1589,15 @@ class TestDeliverer(unittest.TestCase):
                 type("T", (), {"start": lambda s: target()})()
             self.t.on_tick(0.0)
         mock_deliver.assert_called_once()
+
+    def test_on_tick_releases_inflight_when_thread_start_fails(self):
+        self.t._delivery_mode = "resume"
+        self.t._inbox_put("x", self.cwd)
+        with patch.object(self.t.threading, "Thread") as MockThread:
+            inst = MockThread.return_value
+            inst.start.side_effect = RuntimeError("can't start thread")
+            self.t.on_tick(0.0)
+        self.assertNotIn(self.cwd, self.t._inflight_cwds)
 
 
 if __name__ == "__main__":

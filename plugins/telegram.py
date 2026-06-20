@@ -1421,6 +1421,9 @@ def on_tick(now: float) -> None:
             _inbox_fail(item_path)
             continue
         cwd = info.get("cwd", "")
+        if not cwd:
+            _inbox_fail(item_path)
+            continue
         with _inflight_lock:
             if cwd in _inflight_cwds:
                 continue
@@ -1433,7 +1436,12 @@ def on_tick(now: float) -> None:
                 with _inflight_lock:
                     _inflight_cwds.discard(c)
 
-        threading.Thread(target=_run, daemon=True).start()
+        try:
+            threading.Thread(target=_run, daemon=True).start()
+        except Exception as exc:
+            with _inflight_lock:
+                _inflight_cwds.discard(cwd)
+            _log(f"failed to spawn delivery thread for {cwd}: {exc}")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
