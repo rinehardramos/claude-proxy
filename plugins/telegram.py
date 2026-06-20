@@ -1381,6 +1381,7 @@ def _deliver_one(item_path: Path) -> None:
         proc = subprocess.run(
             [_claude_bin, "--continue", "--print", text],
             cwd=cwd, capture_output=True, text=True, timeout=_resume_timeout,
+            stdin=subprocess.DEVNULL,
             env=env,
         )
         if proc.returncode == 0:

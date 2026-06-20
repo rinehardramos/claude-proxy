@@ -1643,6 +1643,14 @@ class TestDeliverer(unittest.TestCase):
         env = m.call_args.kwargs["env"]
         self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:18019")
 
+    def test_deliver_passes_devnull_stdin(self):
+        """claude --print waits ~3s for stdin; pass DEVNULL so it never stalls."""
+        import subprocess as _sp
+        p = self.t._inbox_put("x", self.cwd)
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")) as m:
+            self.t._deliver_one(p)
+        self.assertEqual(m.call_args.kwargs.get("stdin"), _sp.DEVNULL)
+
 
 class TestPollerWatchdog(unittest.TestCase):
     def setUp(self):
