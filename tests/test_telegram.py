@@ -506,6 +506,45 @@ class TestSplitMessage(unittest.TestCase):
     def test_safe_cut_full_when_within_limit(self):
         self.assertEqual(self.t._safe_cut("short", 100), 5)
 
+    @staticmethod
+    def _has_nested_block(html):
+        """True if a <pre> sits inside an open <blockquote>, or blockquotes nest.
+
+        Telegram rejects nested block-level entities with HTTP 400.
+        """
+        import re
+        depth = 0
+        for tok in re.findall(r"</?blockquote>|<pre>", html):
+            if tok == "<blockquote>":
+                if depth:
+                    return True
+                depth += 1
+            elif tok == "</blockquote>":
+                depth -= 1
+            elif tok == "<pre>" and depth:
+                return True
+        return False
+
+    def test_pre_table_not_nested_in_blockquote_short(self):
+        resp = "Here is data:\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nDone."
+        chunks = self.t._split_message(resp, "proj", "q")
+        self.assertEqual(len(chunks), 1)
+        self.assertFalse(self._has_nested_block(chunks[0]),
+                         f"<pre> nested in <blockquote>: {chunks[0]!r}")
+
+    def test_pre_table_not_nested_when_split(self):
+        table = "| col1 | col2 |\n|---|---|\n| aaaa | bbbb |\n"
+        resp = ("x " * 2400) + table + ("y " * 2400)
+        chunks = self.t._split_message(resp, "proj", "q")
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertFalse(self._has_nested_block(c), "nested block in a chunk")
+            self.assertLessEqual(len(c), self.t.MAX_TG_LENGTH)
+
+    def test_plain_response_still_blockquoted(self):
+        chunks = self.t._split_message("just text", "proj", "q")
+        self.assertIn("<blockquote>just text</blockquote>", chunks[0])
+
 
 # ── on_inbound integration ───────────────────────────────────────────────
 

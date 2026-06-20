@@ -669,6 +669,27 @@ def _safe_cut(text: str, limit: int) -> int:
     return cut
 
 
+_PRE_BLOCK_RE = re.compile(r"(<pre>.*?</pre>)", re.DOTALL)
+
+
+def _wrap_body(body: str) -> str:
+    """Wrap prose in <blockquote>; keep <pre> blocks as top-level siblings.
+
+    Telegram forbids nested block-level entities, so a <pre> (markdown table or
+    code block) must NOT live inside a <blockquote> — that returns HTTP 400.
+    """
+    parts = _PRE_BLOCK_RE.split(body)
+    out: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        if part.startswith("<pre>"):
+            out.append(part)
+        else:
+            out.append(f"<blockquote>{part}</blockquote>")
+    return "".join(out)
+
+
 def _split_message(
     response: str,
     project: str,
@@ -688,16 +709,15 @@ def _split_message(
     if tts_diagnostic:
         first_header += f"Audio unavailable: {_esc(tts_diagnostic)}. Sending as text.\n"
 
-    # Wrap/close tags add to overhead per chunk
-    bq_open = "<blockquote>"
-    bq_close = "</blockquote>"
-    bq_overhead = len(bq_open) + len(bq_close)
+    # _wrap_body adds <blockquote> tags around each prose segment; reserve a
+    # margin so a wrapped chunk stays under the limit even with a few segments.
+    wrap_reserve = 256
 
     esc_response = _md_to_tg_html(response)
-    first_body_max = MAX_TG_LENGTH - len(first_header) - bq_overhead
+    first_body_max = MAX_TG_LENGTH - len(first_header) - wrap_reserve
 
     if first_body_max >= len(esc_response):
-        return [f"{first_header}{bq_open}{esc_response}{bq_close}"]
+        return [f"{first_header}{_wrap_body(esc_response)}"]
 
     # Pre-scan to figure out total chunk count. Cut at HTML-safe boundaries so a
     # chunk never ends inside an entity (&amp;) or tag (<pre>) — Telegram rejects
@@ -708,16 +728,16 @@ def _split_message(
     raw_chunks.append(rest[:cut])
     rest = rest[cut:]
     cont_header_template = f"<b>{esc_project} [00/00]</b>\n"
-    cont_body_max = MAX_TG_LENGTH - len(cont_header_template) - bq_overhead
+    cont_body_max = MAX_TG_LENGTH - len(cont_header_template) - wrap_reserve
     while rest:
         cut = _safe_cut(rest, cont_body_max)
         raw_chunks.append(rest[:cut])
         rest = rest[cut:]
 
     total = len(raw_chunks)
-    result = [f"{first_header}{bq_open}{raw_chunks[0]}{bq_close}"]
+    result = [f"{first_header}{_wrap_body(raw_chunks[0])}"]
     for i, body in enumerate(raw_chunks[1:], start=2):
-        result.append(f"<b>{esc_project} [{i}/{total}]</b>\n{bq_open}{body}{bq_close}")
+        result.append(f"<b>{esc_project} [{i}/{total}]</b>\n{_wrap_body(body)}")
     return result
 
 
