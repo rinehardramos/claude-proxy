@@ -834,7 +834,7 @@ def on_monitor_recycle(reason: str, value: int, threshold: int) -> None:
 
 
 def _handle_text_message(msg: dict, token: str, chat_id: str) -> None:
-    """Handle incoming text messages: replies, /mute command."""
+    """Handle incoming text messages: replies, /mute, /mode, /project commands."""
     global _muted, _waiting_for_reply, _csm_waiting_reply_pid
 
     text = msg.get("text", "").strip()
@@ -906,6 +906,7 @@ def _handle_text_message(msg: dict, token: str, chat_id: str) -> None:
                     _pending_replies.append(prompt)
                 _send_text(token, chat_id, "✅ Queued (inject mode — lands on next request)")
             return
+        return  # any /project command is fully handled; never fall through
 
     # Session-monitor text reply: user typed text after tapping 💬 Reply
     _log(f"text msg received: csm_pid={_csm_waiting_reply_pid} waiting_reply={_waiting_for_reply}")
