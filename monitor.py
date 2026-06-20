@@ -144,20 +144,40 @@ class ResourceMonitor:
         self._last_recycle_at = self._clock()
         self._last_recycle_reason = reason
 
-    def start(self, on_recycle: Callable[[Breach], None], interval_s: float = 60.0) -> None:
+    def start(self, on_recycle: Callable[[Breach], None], interval_s: float = 60.0,
+              on_tick: Optional[Callable[[float], None]] = None,
+              tick_interval_s: float = 3.0) -> None:
         if hasattr(self, "_stop_event") and not self._stop_event.is_set():
             raise RuntimeError("ResourceMonitor is already running; call stop() first")
+        if on_tick is not None and tick_interval_s <= 0:
+            raise ValueError(f"tick_interval_s must be > 0, got {tick_interval_s!r}")
         self._stop_event = threading.Event()
 
+        def _eval_recycle():
+            breach = self.should_recycle()
+            if breach is not None:
+                self.mark_recycled(breach.reason)
+                try:
+                    on_recycle(breach)
+                except Exception as exc:
+                    print(f"[monitor] on_recycle callback failed: {exc}", file=sys.stderr)
+
         def loop():
-            while not self._stop_event.wait(interval_s):
-                breach = self.should_recycle()
-                if breach is not None:
-                    self.mark_recycled(breach.reason)
-                    try:
-                        on_recycle(breach)
-                    except Exception as exc:
-                        print(f"[monitor] on_recycle callback failed: {exc}", file=sys.stderr)
+            if on_tick is None:
+                while not self._stop_event.wait(interval_s):
+                    _eval_recycle()
+                return
+            ticks_per_eval = max(1, round(interval_s / tick_interval_s))
+            n = 0
+            while not self._stop_event.wait(tick_interval_s):
+                try:
+                    on_tick(self._clock())
+                except Exception as exc:
+                    print(f"[monitor] on_tick callback failed: {exc}", file=sys.stderr)
+                n += 1
+                if n >= ticks_per_eval:
+                    n = 0
+                    _eval_recycle()
 
         self._thread = threading.Thread(target=loop, daemon=True, name="ResourceMonitor")
         self._thread.start()

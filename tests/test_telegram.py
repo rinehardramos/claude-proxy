@@ -187,6 +187,33 @@ class TestConfigure(unittest.TestCase):
             self.t.configure({"tts_openai_api_key_env": "MY_OAI_KEY"})
         self.assertEqual(self.t._tts_openai_api_key, "sk-custom")
 
+    def test_reads_delivery_config_defaults(self):
+        env = self._clean_env()
+        env["TELEGRAM_BOT_TOKEN"] = "tok"
+        env["TELEGRAM_CHAT_ID"] = "chat"
+        with patch.dict(os.environ, env, clear=True):
+            self.t.configure({})
+        self.assertEqual(self.t._delivery_mode, "inject")
+        self.assertEqual(self.t._claude_bin, "claude")
+        self.assertEqual(self.t._resume_timeout, 300)
+        self.assertEqual(self.t._resume_max_attempts, 3)
+
+    def test_reads_delivery_config_overrides(self):
+        env = self._clean_env()
+        env["TELEGRAM_BOT_TOKEN"] = "tok"
+        env["TELEGRAM_CHAT_ID"] = "chat"
+        with patch.dict(os.environ, env, clear=True):
+            self.t.configure({
+                "delivery_mode": "resume",
+                "claude_bin": "/usr/local/bin/claude",
+                "resume_timeout": 120,
+                "resume_max_attempts": 5,
+            })
+        self.assertEqual(self.t._delivery_mode, "resume")
+        self.assertEqual(self.t._claude_bin, "/usr/local/bin/claude")
+        self.assertEqual(self.t._resume_timeout, 120)
+        self.assertEqual(self.t._resume_max_attempts, 5)
+
 
 # ── Dynamic Timeout ──────────────────────────────────────────────────────
 
@@ -570,6 +597,27 @@ class TestOnInbound(unittest.TestCase):
         _, captured = self._call_and_capture("response", {"model": "claude"})
         self.assertEqual(len(captured), 1)
 
+    def _call_with_message_ids(self, response_text, request_summary, ids):
+        """urlopen returns sequential message_ids so the registry can record them."""
+        seq = list(ids)
+        def mock_urlopen(req, timeout=None):
+            mid = seq.pop(0) if seq else 1
+            class R:
+                def read(self_inner):
+                    return json.dumps({"ok": True, "result": {"message_id": mid}}).encode()
+            return R()
+        with patch.object(urllib.request, "urlopen", side_effect=mock_urlopen):
+            self.t.on_inbound(response_text, request_summary)
+            for th in threading.enumerate():
+                if th.daemon and th is not threading.current_thread():
+                    th.join(timeout=2)
+
+    def test_on_inbound_records_message_cwd(self):
+        self._call_with_message_ids(
+            "hello", {"user_text": "hi", "cwd": "/home/u/projX"}, ids=[777])
+        self.assertEqual(self.t._cwd_for_message(777), "/home/u/projX")
+        self.assertEqual(self.t._last_active_cwd, "/home/u/projX")
+
 
 class TestTTSPathIntegration(unittest.TestCase):
     def setUp(self):
@@ -804,6 +852,29 @@ class TestCallbackPoller(unittest.TestCase):
         self.t.HOOK_DIR = self._orig_hook_dir
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_get_updates_requests_message_updates(self):
+        """The poller must explicitly request message updates, not just callbacks.
+
+        Telegram persists allowed_updates server-side; if the poller omits it,
+        a stale callback-only filter silently drops all text messages.
+        """
+        captured = {}
+
+        class _Resp:
+            def read(self_inner):
+                return json.dumps({"ok": True, "result": []}).encode()
+
+        def mock_urlopen(url, timeout=None):
+            captured["url"] = url
+            return _Resp()
+
+        with patch.object(urllib.request, "urlopen", side_effect=mock_urlopen):
+            self.t._get_updates("TOK", 5, timeout=30)
+
+        self.assertIn("allowed_updates", captured["url"])
+        self.assertIn("message", captured["url"])
+        self.assertIn("callback_query", captured["url"])
 
     def test_handle_callback_approve(self):
         """Approve callback writes decided file and removes pending."""
@@ -1133,6 +1204,30 @@ class TestHandleTextMessage(unittest.TestCase):
     def test_mode_default_is_ask(self):
         self.assertEqual(self.t._approval_mode, "ask")
 
+    def test_plain_message_forwarded_to_session(self):
+        """Any plain (non-command) message is queued for the running session."""
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "do the thing"}, "tok", "chat")
+        self.assertEqual(self.t._pending_replies, ["do the thing"])
+
+    def test_plain_message_sends_confirmation(self):
+        """Forwarding a plain message sends a confirmation back to Telegram."""
+        with patch("urllib.request.urlopen") as mock_url:
+            self.t._handle_text_message({"text": "hello session"}, "tok", "chat")
+        self.assertTrue(mock_url.called)
+
+    def test_blank_message_not_forwarded(self):
+        """Whitespace-only messages are ignored, not forwarded."""
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "   "}, "tok", "chat")
+        self.assertEqual(self.t._pending_replies, [])
+
+    def test_command_not_forwarded_as_message(self):
+        """Recognized commands are handled, not forwarded to the session."""
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "/mute"}, "tok", "chat")
+        self.assertEqual(self.t._pending_replies, [])
+
 
 def test_telegram_on_monitor_recycle_formats_message(monkeypatch):
     import plugins.telegram as tg
@@ -1156,6 +1251,427 @@ def test_telegram_recycle_opt_out(monkeypatch):
 
     tg.on_monitor_recycle("rss_exceeded", 614, 512)
     assert sent == []
+
+
+class TestMessageRegistry(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+
+    def test_record_and_resolve(self):
+        self.t._record_message_target(42, "/home/u/proj")
+        self.assertEqual(self.t._cwd_for_message(42), "/home/u/proj")
+
+    def test_record_updates_last_active(self):
+        self.t._record_message_target(1, "/home/u/a")
+        self.assertEqual(self.t._last_active_cwd, "/home/u/a")
+
+    def test_resolve_unknown_returns_none(self):
+        self.assertIsNone(self.t._cwd_for_message(999))
+
+    def test_none_message_id_ignored_but_sets_last_active(self):
+        self.t._record_message_target(None, "/home/u/b")
+        self.assertEqual(self.t._last_active_cwd, "/home/u/b")
+        self.assertIsNone(self.t._cwd_for_message(None))
+
+    def test_fifo_eviction_at_cap(self):
+        self.t._MSG_CWD_CAP = 3
+        for i in range(5):
+            self.t._record_message_target(i, f"/p/{i}")
+        # Oldest (0, 1) evicted; newest kept
+        self.assertIsNone(self.t._cwd_for_message(0))
+        self.assertIsNone(self.t._cwd_for_message(1))
+        self.assertEqual(self.t._cwd_for_message(4), "/p/4")
+
+    def test_recent_cwds_most_recent_first_deduped(self):
+        self.t._record_message_target(1, "/p/a")
+        self.t._record_message_target(2, "/p/b")
+        self.t._record_message_target(3, "/p/a")
+        self.assertEqual(self.t._recent_cwds(), ["/p/a", "/p/b"])
+
+
+class TestCwdOverride(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.t.HOOK_DIR = Path(self.tmp)
+        self.t._CWD_OVERRIDE_FILE = Path(self.tmp) / "cwd_override"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_set_valid_dir_succeeds_and_persists(self):
+        ok, resolved = self.t._set_cwd_override(self.tmp)
+        self.assertTrue(ok)
+        self.assertEqual(resolved, str(Path(self.tmp).resolve()))
+        self.assertEqual(self.t._get_cwd_override(), resolved)
+        self.assertEqual(self.t._CWD_OVERRIDE_FILE.read_text().strip(), resolved)
+
+    def test_set_invalid_dir_rejected_state_unchanged(self):
+        ok, resolved = self.t._set_cwd_override(self.tmp + "/nope")
+        self.assertFalse(ok)
+        self.assertIsNone(self.t._get_cwd_override())
+
+    def test_normalize_expands_tilde(self):
+        # ~ resolves to the proxy user's home; just assert no literal ~ remains
+        norm = self.t._normalize_cwd("~/somewhere")
+        self.assertNotIn("~", norm)
+        self.assertTrue(norm.startswith("/"))
+
+    def test_clear_removes_override_and_file(self):
+        self.t._set_cwd_override(self.tmp)
+        self.t._clear_cwd_override()
+        self.assertIsNone(self.t._get_cwd_override())
+        self.assertFalse(self.t._CWD_OVERRIDE_FILE.exists())
+
+    def test_load_restores_persisted_override(self):
+        self.t._CWD_OVERRIDE_FILE.write_text(str(Path(self.tmp).resolve()))
+        self.t._load_cwd_override()
+        self.assertEqual(self.t._get_cwd_override(), str(Path(self.tmp).resolve()))
+
+    def test_load_ignores_deleted_dir(self):
+        self.t._CWD_OVERRIDE_FILE.write_text("/nonexistent/dir/xyz")
+        self.t._load_cwd_override()
+        self.assertIsNone(self.t._get_cwd_override())
+
+
+class TestParseProjectCommand(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+
+    def test_no_arg_is_show(self):
+        self.assertEqual(self.t._parse_project_command("/project"), ("show", None, None))
+
+    def test_path_only_is_set(self):
+        self.assertEqual(
+            self.t._parse_project_command("/project ~/foo"), ("set", "~/foo", None))
+
+    def test_path_plus_prompt_is_oneshot(self):
+        self.assertEqual(
+            self.t._parse_project_command("/project ~/foo fix the test"),
+            ("oneshot", "~/foo", "fix the test"))
+
+    def test_clear_keyword(self):
+        self.assertEqual(self.t._parse_project_command("/project clear"), ("clear", None, None))
+
+    def test_off_keyword(self):
+        self.assertEqual(self.t._parse_project_command("/project off"), ("clear", None, None))
+
+    def test_quoted_path_with_spaces(self):
+        action, path, prompt = self.t._parse_project_command('/project "~/my proj" do it')
+        self.assertEqual(action, "oneshot")
+        self.assertEqual(path, "~/my proj")
+        self.assertEqual(prompt, "do it")
+
+
+class TestInbox(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.t.HOOK_DIR = Path(self.tmp)
+        self.t._INBOX_DIR = Path(self.tmp) / "session-inbox"
+        self.t._INBOX_FAILED_DIR = self.t._INBOX_DIR / "failed"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_put_creates_item(self):
+        p = self.t._inbox_put("hello", "/home/u/p")
+        self.assertTrue(p.exists())
+        info = json.loads(p.read_text())
+        self.assertEqual(info["text"], "hello")
+        self.assertEqual(info["cwd"], "/home/u/p")
+        self.assertEqual(info["attempts"], 0)
+
+    def test_list_returns_items_sorted(self):
+        a = self.t._inbox_put("1", "/p")
+        b = self.t._inbox_put("2", "/p")
+        listed = self.t._inbox_list()
+        self.assertEqual(listed, sorted([a, b]))
+
+    def test_complete_removes_item(self):
+        p = self.t._inbox_put("x", "/p")
+        self.t._inbox_complete(p)
+        self.assertFalse(p.exists())
+
+    def test_fail_moves_to_failed_dir(self):
+        p = self.t._inbox_put("x", "/p")
+        self.t._inbox_fail(p)
+        self.assertFalse(p.exists())
+        moved = self.t._INBOX_FAILED_DIR / p.name
+        self.assertTrue(moved.exists())
+
+    def test_list_empty_when_no_dir(self):
+        self.assertEqual(self.t._inbox_list(), [])
+
+
+class TestResolveTarget(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+
+    def test_native_reply_wins(self):
+        self.t._record_message_target(5, "/p/replytarget")
+        self.t._cwd_override = "/p/override"
+        self.t._last_active_cwd = "/p/last"
+        msg = {"reply_to_message": {"from": {"is_bot": True}, "message_id": 5}}
+        self.assertEqual(self.t._resolve_target(msg), "/p/replytarget")
+
+    def test_override_used_when_no_reply(self):
+        self.t._cwd_override = "/p/override"
+        self.t._last_active_cwd = "/p/last"
+        self.assertEqual(self.t._resolve_target({}), "/p/override")
+
+    def test_last_active_when_no_override(self):
+        self.t._last_active_cwd = "/p/last"
+        self.assertEqual(self.t._resolve_target({}), "/p/last")
+
+    def test_none_when_nothing_known(self):
+        self.assertIsNone(self.t._resolve_target({}))
+
+    def test_reply_to_unknown_message_falls_through(self):
+        self.t._last_active_cwd = "/p/last"
+        msg = {"reply_to_message": {"from": {"is_bot": True}, "message_id": 999}}
+        self.assertEqual(self.t._resolve_target(msg), "/p/last")
+
+
+class TestProjectCommand(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.t.HOOK_DIR = Path(self.tmp)
+        self.t._CWD_OVERRIDE_FILE = Path(self.tmp) / "cwd_override"
+        self.t._INBOX_DIR = Path(self.tmp) / "session-inbox"
+        self.t._INBOX_FAILED_DIR = self.t._INBOX_DIR / "failed"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_set_override_valid(self):
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": f"/project {self.tmp}"}, "tok", "chat")
+        self.assertEqual(self.t._get_cwd_override(), str(Path(self.tmp).resolve()))
+
+    def test_set_override_invalid_rejected(self):
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message(
+                {"text": f"/project {self.tmp}/nope"}, "tok", "chat")
+        self.assertIsNone(self.t._get_cwd_override())
+
+    def test_clear_override(self):
+        self.t._set_cwd_override(self.tmp)
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "/project clear"}, "tok", "chat")
+        self.assertIsNone(self.t._get_cwd_override())
+
+    def test_oneshot_resume_mode_writes_inbox(self):
+        self.t._delivery_mode = "resume"
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message(
+                {"text": f"/project {self.tmp} do the thing"}, "tok", "chat")
+        items = self.t._inbox_list()
+        self.assertEqual(len(items), 1)
+        info = json.loads(items[0].read_text())
+        self.assertEqual(info["text"], "do the thing")
+        self.assertEqual(info["cwd"], str(Path(self.tmp).resolve()))
+        # oneshot must NOT change sticky override
+        self.assertIsNone(self.t._get_cwd_override())
+
+    def test_show_does_not_crash(self):
+        with patch("urllib.request.urlopen") as m:
+            self.t._handle_text_message({"text": "/project"}, "tok", "chat")
+        self.assertTrue(m.called)
+
+    def test_project_not_treated_as_plain_message(self):
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "/project clear"}, "tok", "chat")
+        self.assertEqual(self.t._pending_replies, [])
+
+
+class TestPlainMessageRouting(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.t.HOOK_DIR = Path(self.tmp)
+        self.t._INBOX_DIR = Path(self.tmp) / "session-inbox"
+        self.t._INBOX_FAILED_DIR = self.t._INBOX_DIR / "failed"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_resume_mode_routes_to_inbox(self):
+        self.t._delivery_mode = "resume"
+        self.t._last_active_cwd = "/home/u/projY"
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "run the tests"}, "tok", "chat")
+        items = self.t._inbox_list()
+        self.assertEqual(len(items), 1)
+        info = json.loads(items[0].read_text())
+        self.assertEqual(info["text"], "run the tests")
+        self.assertEqual(info["cwd"], "/home/u/projY")
+        self.assertEqual(self.t._pending_replies, [])
+
+    def test_inject_mode_still_queues(self):
+        self.t._delivery_mode = "inject"
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "hello"}, "tok", "chat")
+        self.assertEqual(self.t._pending_replies, ["hello"])
+        self.assertEqual(self.t._inbox_list(), [])
+
+    def test_resume_mode_no_target_falls_back_to_queue(self):
+        self.t._delivery_mode = "resume"
+        self.t._last_active_cwd = None
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message({"text": "hello"}, "tok", "chat")
+        self.assertEqual(self.t._pending_replies, ["hello"])
+        self.assertEqual(self.t._inbox_list(), [])
+
+    def test_resume_mode_inbox_failure_falls_back_to_queue(self):
+        self.t._delivery_mode = "resume"
+        self.t._last_active_cwd = "/home/u/projY"
+        with patch("urllib.request.urlopen"), \
+             patch.object(self.t, "_inbox_put", side_effect=OSError("disk full")):
+            self.t._handle_text_message({"text": "important msg"}, "tok", "chat")
+        # message must NOT be lost — it falls back to the inject queue
+        self.assertEqual(self.t._pending_replies, ["important msg"])
+        self.assertEqual(self.t._inbox_list(), [])
+
+    def test_resume_mode_native_reply_routes_to_replied_project(self):
+        self.t._delivery_mode = "resume"
+        # registry maps the replied-to message_id -> a project cwd
+        self.t._record_message_target(555, "/home/u/projReply")
+        self.t._last_active_cwd = "/home/u/other"  # must NOT be chosen
+        msg = {"text": "fix it", "reply_to_message": {"from": {"is_bot": True}, "message_id": 555}}
+        with patch("urllib.request.urlopen"):
+            self.t._handle_text_message(msg, "tok", "chat")
+        items = self.t._inbox_list()
+        self.assertEqual(len(items), 1)
+        info = json.loads(items[0].read_text())
+        self.assertEqual(info["text"], "fix it")
+        self.assertEqual(info["cwd"], "/home/u/projReply")  # registry cwd wins, not last-active
+
+
+class TestDeliverer(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.t.HOOK_DIR = Path(self.tmp)
+        self.t._INBOX_DIR = Path(self.tmp) / "session-inbox"
+        self.t._INBOX_FAILED_DIR = self.t._INBOX_DIR / "failed"
+        self.t._claude_bin = "claude"
+        self.t._resume_timeout = 30
+        self.t._resume_max_attempts = 3
+        self.t._delivery_mode = "resume"
+        # target cwd must exist
+        self.cwd = str(Path(self.tmp).resolve())
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_deliver_success_completes_item(self):
+        p = self.t._inbox_put("do it", self.cwd)
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")) as m:
+            self.t._deliver_one(p)
+        self.assertFalse(p.exists())  # completed
+        args = m.call_args[0][0]
+        self.assertEqual(args[0], "claude")
+        self.assertIn("--continue", args)
+        self.assertIn("--print", args)
+        self.assertEqual(self.t._INBOX_FAILED_DIR.exists() and
+                         list(self.t._INBOX_FAILED_DIR.iterdir()) or [], [])
+
+    def test_deliver_runs_in_target_cwd(self):
+        p = self.t._inbox_put("x", self.cwd)
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")) as m:
+            self.t._deliver_one(p)
+        self.assertEqual(m.call_args.kwargs["cwd"], self.cwd)
+
+    def test_deliver_failure_increments_attempts(self):
+        p = self.t._inbox_put("x", self.cwd)
+        with patch("subprocess.run", return_value=MagicMock(returncode=1, stderr="boom")):
+            self.t._deliver_one(p)
+        self.assertTrue(p.exists())  # not completed
+        self.assertEqual(json.loads(p.read_text())["attempts"], 1)
+
+    def test_deliver_gives_up_after_max_attempts(self):
+        p = self.t._inbox_put("x", self.cwd)
+        # pre-set attempts to max-1 so this run trips the limit
+        info = json.loads(p.read_text()); info["attempts"] = self.t._resume_max_attempts - 1; p.write_text(json.dumps(info))
+        with patch("subprocess.run", return_value=MagicMock(returncode=1, stderr="boom")), \
+             patch.object(self.t, "_send_message"):
+            self.t._deliver_one(p)
+        self.assertFalse(p.exists())
+        self.assertTrue((self.t._INBOX_FAILED_DIR / p.name).exists())
+
+    def test_deliver_missing_cwd_fails_fast(self):
+        p = self.t._inbox_put("x", self.tmp + "/gone")
+        with patch.object(self.t, "_send_message"):
+            self.t._deliver_one(p)
+        self.assertTrue((self.t._INBOX_FAILED_DIR / p.name).exists())
+
+    def test_on_tick_drains_inbox(self):
+        self.t._inbox_put("a", self.cwd)
+        # make delivery synchronous by patching the worker thread to run inline
+        with patch.object(self.t.threading, "Thread") as MockThread, \
+             patch.object(self.t, "_deliver_one") as mock_deliver:
+            MockThread.side_effect = lambda target, daemon=None: \
+                type("T", (), {"start": lambda s: target()})()
+            self.t.on_tick(0.0)
+        mock_deliver.assert_called_once()
+
+    def test_on_tick_releases_inflight_when_thread_start_fails(self):
+        self.t._delivery_mode = "resume"
+        self.t._inbox_put("x", self.cwd)
+        with patch.object(self.t.threading, "Thread") as MockThread:
+            inst = MockThread.return_value
+            inst.start.side_effect = RuntimeError("can't start thread")
+            self.t.on_tick(0.0)
+        self.assertNotIn(self.cwd, self.t._inflight_cwds)
+
+    def test_deliver_sets_anthropic_base_url(self):
+        p = self.t._inbox_put("x", self.cwd)
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")) as m:
+            self.t._deliver_one(p)
+        env = m.call_args.kwargs["env"]
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:18019")
+
+
+class TestPollerWatchdog(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+        self.t._bot_token = "tok"
+        self.t._chat_id = "chat"
+        self.t._delivery_mode = "inject"  # so the drain part is skipped
+
+    def test_respawns_dead_poller(self):
+        self.t._poller_thread = None
+        with patch.object(self.t, "_start_poller") as mock_start:
+            self.t.on_tick(0.0)
+        mock_start.assert_called_once()
+
+    def test_does_not_respawn_live_poller(self):
+        class FakeThread:
+            def is_alive(self):
+                return True
+        self.t._poller_thread = FakeThread()
+        with patch.object(self.t, "_start_poller") as mock_start:
+            self.t.on_tick(0.0)
+        mock_start.assert_not_called()
+
+    def test_no_respawn_without_credentials(self):
+        self.t._bot_token = None
+        self.t._poller_thread = None
+        with patch.object(self.t, "_start_poller") as mock_start:
+            self.t.on_tick(0.0)
+        mock_start.assert_not_called()
 
 
 if __name__ == "__main__":

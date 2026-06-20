@@ -9,14 +9,17 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 import uuid
+from collections import OrderedDict
 from html import escape as _esc
 
 from pathlib import Path
@@ -31,8 +34,55 @@ _tts_openai_model: str = "tts-1"
 _tts_openai_voice: str = "alloy"
 _tts_openai_api_key: str | None = None
 _voice_upload_timeout: int = 300
+_delivery_mode: str = "inject"   # "inject" | "resume"
+_claude_bin: str = "claude"
+_resume_timeout: int = 300
+_resume_max_attempts: int = 3
+_last_active_cwd: str | None = None
 
 MAX_TG_LENGTH = 4096
+
+# ── Project-tag registry (message_id → cwd) ──────────────────────────────
+
+_msg_cwd_lock = threading.Lock()
+_msg_cwd: "OrderedDict[int, str]" = OrderedDict()
+_MSG_CWD_CAP = 500
+
+
+def _record_message_target(message_id: int | None, cwd: str) -> None:
+    """Record which project cwd a sent Telegram message belongs to."""
+    global _last_active_cwd
+    if not cwd:
+        return
+    with _msg_cwd_lock:
+        _last_active_cwd = cwd
+        if not message_id:
+            return
+        _msg_cwd[message_id] = cwd
+        _msg_cwd.move_to_end(message_id)
+        while len(_msg_cwd) > _MSG_CWD_CAP:
+            _msg_cwd.popitem(last=False)
+
+
+def _cwd_for_message(message_id: int | None) -> str | None:
+    if not message_id:
+        return None
+    with _msg_cwd_lock:
+        return _msg_cwd.get(message_id)
+
+
+def _recent_cwds(limit: int = 10) -> list[str]:
+    """Distinct cwds, most-recently-recorded first."""
+    seen: list[str] = []
+    with _msg_cwd_lock:
+        for cwd in reversed(list(_msg_cwd.values())):
+            if cwd not in seen:
+                seen.append(cwd)
+            if len(seen) >= limit:
+                break
+    return seen
+
+
 MAX_TG_CAPTION = 1024
 
 # ── Callback poller state ────────────────────────────────────────────────
@@ -225,12 +275,78 @@ _register_tts("openai", _check_openai, _generate_openai)
 _register_tts("pyttsx3", _check_pyttsx3, _generate_pyttsx3)
 
 
+# ── Project cwd override (/project sticky target) ────────────────────────
+
+_CWD_OVERRIDE_FILE = HOOK_DIR / "cwd_override"
+_cwd_override: str | None = None
+
+
+def _normalize_cwd(path: str) -> str:
+    """expandvars → expanduser → resolve to an absolute path string."""
+    expanded = os.path.expandvars(path)
+    return str(Path(expanded).expanduser().resolve())
+
+
+def _set_cwd_override(path: str) -> tuple[bool, str]:
+    """Validate and persist a sticky project override. Returns (ok, resolved)."""
+    global _cwd_override
+    resolved = _normalize_cwd(path)
+    if not Path(resolved).is_dir():
+        return False, resolved
+    _cwd_override = resolved
+    try:
+        HOOK_DIR.mkdir(parents=True, exist_ok=True)
+        _CWD_OVERRIDE_FILE.write_text(resolved)
+    except OSError as exc:
+        _log(f"could not persist cwd override: {exc}")
+    return True, resolved
+
+
+def _get_cwd_override() -> str | None:
+    return _cwd_override
+
+
+def _clear_cwd_override() -> None:
+    global _cwd_override
+    _cwd_override = None
+    try:
+        _CWD_OVERRIDE_FILE.unlink()
+    except OSError:
+        pass
+
+
+def _load_cwd_override() -> None:
+    """Restore a persisted override if its directory still exists."""
+    global _cwd_override
+    try:
+        val = _CWD_OVERRIDE_FILE.read_text().strip()
+    except OSError:
+        return
+    if val and Path(val).is_dir():
+        _cwd_override = val
+
+
+def _resolve_target(msg: dict) -> str | None:
+    """Resolve the target project cwd for an incoming message.
+
+    Precedence: native reply-to-bot → /project override → last-active.
+    """
+    reply_to = msg.get("reply_to_message", {})
+    if reply_to.get("from", {}).get("is_bot"):
+        cwd = _cwd_for_message(reply_to.get("message_id"))
+        if cwd:
+            return cwd
+    if _cwd_override:
+        return _cwd_override
+    return _last_active_cwd
+
+
 # ── Plugin interface ──────────────────────────────────────────────────────
 
 def plugin_info() -> dict:
     return {
         "name": "telegram",
-        "version": "0.4.0",
+        "version": "0.6.0",
         "description": "Telegram notifications with TTS audio fallback",
     }
 
@@ -241,6 +357,7 @@ def configure(config: dict) -> None:
     global _audio_threshold, _tts_engine, _voice_upload_timeout
     global _tts_openai_model, _tts_openai_voice, _tts_openai_api_key
     global _notify_on_recycle
+    global _delivery_mode, _claude_bin, _resume_timeout, _resume_max_attempts
 
     _project_name = config.get("project_name", "")  # explicit override only; dynamic cwd used at runtime
     _audio_threshold = int(config.get("audio_threshold", 8192))
@@ -254,6 +371,11 @@ def configure(config: dict) -> None:
     _tts_openai_api_key = config.get("tts_openai_api_key") or os.environ.get(api_key_env)
 
     _notify_on_recycle = bool(config.get("notify_on_recycle", True))
+
+    _delivery_mode = config.get("delivery_mode", "inject")
+    _claude_bin = config.get("claude_bin", "claude")
+    _resume_timeout = int(config.get("resume_timeout", 300))
+    _resume_max_attempts = int(config.get("resume_max_attempts", 3))
 
     # Credentials
     _bot_token = config.get("bot_token")
@@ -284,10 +406,39 @@ def configure(config: dict) -> None:
     if config.get("approval_poller", "").lower() in ("true", "1", "yes", "on"):
         _start_poller()
 
+    _load_cwd_override()
+
 
 # ── Option extraction ────────────────────────────────────────────────────
 
 _NUMBERED_OPTION_RE = re.compile(r"^\s*(\d+)\.\s+(.+)$", re.MULTILINE)
+
+
+def _parse_project_command(text: str) -> tuple[str, str | None, str | None]:
+    """Parse a /project command into (action, path, prompt).
+
+    Forms:
+      /project                 → ("show", None, None)
+      /project <path>          → ("set", path, None)
+      /project <path> <prompt> → ("oneshot", path, prompt)
+      /project clear | off     → ("clear", None, None)
+    Quoted paths with spaces are honored.
+    """
+    body = text[len("/project"):].strip()
+    if not body:
+        return ("show", None, None)
+    try:
+        tokens = shlex.split(body)
+    except ValueError:
+        tokens = body.split()
+    if not tokens:
+        return ("show", None, None)
+    path = tokens[0]
+    if path.lower() in ("clear", "off"):
+        return ("clear", None, None)
+    if len(tokens) > 1:
+        return ("oneshot", path, " ".join(tokens[1:]))
+    return ("set", path, None)
 
 
 def _extract_options(text: str) -> list[str] | None:
@@ -402,7 +553,14 @@ def on_inbound(response_text: str, request_summary: dict) -> str | None:
                     req = urllib.request.Request(
                         tg_url, data=data, headers={"Content-Type": "application/json"},
                     )
-                    urllib.request.urlopen(req, timeout=10)
+                    resp = urllib.request.urlopen(req, timeout=10)
+                    try:
+                        result = json.loads(resp.read())
+                        mid = result.get("result", {}).get("message_id")
+                    except Exception:
+                        mid = None
+                    if cwd:
+                        _record_message_target(mid, cwd)
                 except Exception as exc:
                     _log(f"ERROR: {exc}")
         except Exception as exc:
@@ -618,8 +776,17 @@ def _send_voice(token: str, chat_id: str, ogg_path: str, caption: str, timeout: 
 # ── Callback Poller ──────────────────────────────────────────────────────
 
 def _get_updates(token: str, offset: int, timeout: int = 30) -> list[dict]:
-    """Long-poll Telegram getUpdates for new updates."""
-    url = f"https://api.telegram.org/bot{token}/getUpdates?offset={offset}&timeout={timeout}"
+    """Long-poll Telegram getUpdates for new updates.
+
+    allowed_updates is sent explicitly on every call. Telegram persists the
+    last value server-side, so omitting it lets a stale callback-only filter
+    silently drop all text messages — which breaks command/message handling.
+    """
+    allowed = urllib.parse.quote('["message","edited_message","callback_query"]')
+    url = (
+        f"https://api.telegram.org/bot{token}/getUpdates"
+        f"?offset={offset}&timeout={timeout}&allowed_updates={allowed}"
+    )
     resp = urllib.request.urlopen(url, timeout=timeout + 10)
     data = json.loads(resp.read())
     return data.get("result", [])
@@ -677,7 +844,7 @@ def on_monitor_recycle(reason: str, value: int, threshold: int) -> None:
 
 
 def _handle_text_message(msg: dict, token: str, chat_id: str) -> None:
-    """Handle incoming text messages: replies, /mute command."""
+    """Handle incoming text messages: replies, /mute, /mode, /project commands."""
     global _muted, _waiting_for_reply, _csm_waiting_reply_pid
 
     text = msg.get("text", "").strip()
@@ -713,6 +880,44 @@ def _handle_text_message(msg: dict, token: str, chat_id: str) -> None:
                        f"Usage: /mode auto-approve | ask | auto-deny")
         return
 
+    # /project command — project targeting
+    if text.lower() == "/project" or text.lower().startswith("/project "):
+        action, path, prompt = _parse_project_command(text)
+        if action == "show":
+            ov = _get_cwd_override()
+            effective = ov or _last_active_cwd or "(none)"
+            lines = [f"Target: {effective}", f"Override: {ov or '(none)'}"]
+            recents = _recent_cwds()
+            if recents:
+                lines.append("Recent:\n" + "\n".join(f"• {c}" for c in recents))
+            _send_text(token, chat_id, "\n".join(lines))
+            return
+        if action == "clear":
+            _clear_cwd_override()
+            _send_text(token, chat_id, "✅ Override cleared")
+            return
+        if action == "set":
+            ok, resolved = _set_cwd_override(path)
+            if ok:
+                _send_text(token, chat_id, f"✅ Project: {resolved}")
+            else:
+                _send_text(token, chat_id, f"⚠ Not a directory: {resolved}")
+            return
+        if action == "oneshot":
+            resolved = _normalize_cwd(path)
+            if not Path(resolved).is_dir():
+                _send_text(token, chat_id, f"⚠ Not a directory: {resolved}")
+                return
+            if _delivery_mode == "resume":
+                _inbox_put(prompt, resolved)
+                _send_text(token, chat_id, f"✅ Sent to {os.path.basename(resolved)}")
+            else:
+                with _pending_replies_lock:
+                    _pending_replies.append(prompt)
+                _send_text(token, chat_id, "✅ Queued (inject mode — lands on next request)")
+            return
+        return  # any /project command is fully handled; never fall through
+
     # Session-monitor text reply: user typed text after tapping 💬 Reply
     _log(f"text msg received: csm_pid={_csm_waiting_reply_pid} waiting_reply={_waiting_for_reply}")
     if _csm_waiting_reply_pid is not None:
@@ -734,14 +939,24 @@ def _handle_text_message(msg: dict, token: str, chat_id: str) -> None:
         _log(f"reply queued ({len(text)} chars)")
         return
 
-    # Reply-to-message: user used Telegram's native reply on a bot message
-    reply_to = msg.get("reply_to_message", {})
-    if reply_to.get("from", {}).get("is_bot"):
-        with _pending_replies_lock:
-            _pending_replies.append(text)
-        _send_text(token, chat_id, "\u2705 Reply queued")
-        _log(f"reply-to queued ({len(text)} chars)")
-        return
+    # Fallback: any other plain message is forwarded to the running session.
+    # In "resume" mode it is delivered to the resolved project via the inbox
+    # (wakes idle sessions). In "inject" mode (or when no target is known) it
+    # is queued for on_outbound() to inject into the session's next request.
+    target = _resolve_target(msg)
+    if _delivery_mode == "resume" and target:
+        try:
+            _inbox_put(text, target)
+        except OSError as exc:
+            _log(f"inbox write failed ({exc}); falling back to inject queue")
+        else:
+            _send_text(token, chat_id, f"\u2705 Sent to {os.path.basename(target)}")
+            _log(f"message \u2192 inbox for {target} ({len(text)} chars)")
+            return
+    with _pending_replies_lock:
+        _pending_replies.append(text)
+    _send_text(token, chat_id, "\u2705 Sent to session")
+    _log(f"message forwarded to session ({len(text)} chars)")
 
 
 def _handle_option_callback(cb: dict, token: str, chat_id: str, option_index: str) -> None:
@@ -1091,6 +1306,152 @@ def _start_poller() -> None:
     _poller_stop.clear()
     _poller_thread = threading.Thread(target=_poll_loop, daemon=True, name="tg-poller")
     _poller_thread.start()
+
+
+# ── Session delivery inbox ───────────────────────────────────────────────
+
+_INBOX_DIR = HOOK_DIR / "session-inbox"
+_INBOX_FAILED_DIR = _INBOX_DIR / "failed"
+
+
+def _inbox_put(text: str, cwd: str) -> Path:
+    """Write a delivery item to the durable inbox. Returns its path."""
+    _INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    path = _INBOX_DIR / f"{time.time_ns()}.json"
+    path.write_text(json.dumps({
+        "text": text, "cwd": cwd, "received_at": time.time(), "attempts": 0,
+    }))
+    return path
+
+
+def _inbox_list() -> list[Path]:
+    if not _INBOX_DIR.exists():
+        return []
+    return sorted(p for p in _INBOX_DIR.iterdir() if p.suffix == ".json")
+
+
+def _inbox_complete(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _inbox_fail(path: Path) -> None:
+    try:
+        _INBOX_FAILED_DIR.mkdir(parents=True, exist_ok=True)
+        path.rename(_INBOX_FAILED_DIR / path.name)
+    except OSError:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+# ── Session deliverer (resume mode) ──────────────────────────────────────
+
+_inflight_lock = threading.Lock()
+_inflight_cwds: set[str] = set()
+
+
+def _deliver_one(item_path: Path) -> None:
+    """Deliver one inbox item via `claude --continue --print` in its cwd."""
+    try:
+        info = json.loads(item_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        _inbox_fail(item_path)
+        return
+
+    cwd = info.get("cwd", "")
+    text = info.get("text", "")
+    attempts = int(info.get("attempts", 0))
+
+    if not cwd or not Path(cwd).is_dir():
+        _inbox_fail(item_path)
+        _send_message(
+            f"⚠ Cannot deliver to {cwd or '(unknown)'}: not a directory. "
+            f"Use /project clear or set a valid path."
+        )
+        return
+
+    err = ""
+    try:
+        env = os.environ.copy()
+        env.setdefault("ANTHROPIC_BASE_URL", "http://127.0.0.1:18019")
+        proc = subprocess.run(
+            [_claude_bin, "--continue", "--print", text],
+            cwd=cwd, capture_output=True, text=True, timeout=_resume_timeout,
+            env=env,
+        )
+        if proc.returncode == 0:
+            _inbox_complete(item_path)
+            _log(f"delivered to {cwd} ({len(text)} chars)")
+            return
+        err = (proc.stderr or "").strip()[:300]
+    except FileNotFoundError:
+        err = f"claude binary not found: {_claude_bin}"
+    except subprocess.TimeoutExpired:
+        err = f"timed out after {_resume_timeout}s"
+    except Exception as exc:  # noqa: BLE001 — report any spawn failure
+        err = str(exc)
+
+    attempts += 1
+    info["attempts"] = attempts
+    try:
+        item_path.write_text(json.dumps(info))
+    except OSError:
+        pass
+
+    if attempts >= _resume_max_attempts:
+        _inbox_fail(item_path)
+        _send_message(f"⚠ Delivery to {cwd} failed after {attempts} attempts: {err}")
+    else:
+        _log(f"delivery attempt {attempts} to {cwd} failed: {err}")
+
+
+def on_tick(now: float) -> None:
+    """Called periodically by the proxy's supervised monitor loop.
+
+    Drains the delivery inbox, spawning `claude --continue` per item with a
+    per-cwd in-flight guard so a slow delivery does not pile up across ticks.
+    Also watches the long-poll thread and respawns it if it has died.
+    """
+    # Poller watchdog: respawn the long-poll thread if it has died.
+    if _bot_token and _chat_id:
+        if _poller_thread is None or not _poller_thread.is_alive():
+            _log("poller thread not alive — respawning")
+            _start_poller()
+
+    if _delivery_mode != "resume":
+        return
+    for item_path in _inbox_list():
+        try:
+            info = json.loads(item_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            _inbox_fail(item_path)
+            continue
+        cwd = info.get("cwd", "")
+        if not cwd:
+            _inbox_fail(item_path)
+            continue
+        with _inflight_lock:
+            if cwd in _inflight_cwds:
+                continue
+            _inflight_cwds.add(cwd)
+
+        def _run(p=item_path, c=cwd):
+            try:
+                _deliver_one(p)
+            finally:
+                with _inflight_lock:
+                    _inflight_cwds.discard(c)
+
+        try:
+            threading.Thread(target=_run, daemon=True).start()
+        except Exception as exc:
+            with _inflight_lock:
+                _inflight_cwds.discard(cwd)
+            _log(f"failed to spawn delivery thread for {cwd}: {exc}")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────

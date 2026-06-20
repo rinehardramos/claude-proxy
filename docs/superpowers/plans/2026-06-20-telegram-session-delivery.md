@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Python stdlib only — no third-party imports in `plugins/telegram.py` or `monitor.py`.
-- Run tests with `python3 -m unittest tests.test_<name> -v` from the repo root (activate `.venv` first: `. .venv/bin/activate`). pytest is not available.
+- The project's test runner is **pytest** (installed in `.venv` via `uv pip install pytest`). Activate first: `. .venv/bin/activate`. Run a file with `python3 -m pytest tests/test_<name>.py -q`; a single test with `python3 -m pytest tests/test_<name>.py::TestClass::test_method -q` (or `tests/test_<name>.py::test_func` for bare functions). The telegram tests are `unittest.TestCase`-based and also run under `python3 -m unittest tests.test_telegram.TestClass -v`, but `tests/test_monitor.py` is pytest-style and must be run with pytest. Prefer pytest everywhere for consistency.
 - Tests use the existing pattern in `tests/test_telegram.py`: `_load()` returns a FRESH module instance per test class to prevent module-level state bleed. Always load via `self.t = _load()`.
 - Backward compatibility: `delivery_mode` defaults to `"inject"` → behavior identical to today. All existing telegram tests must stay green.
 - `monitor.py` `ResourceMonitor.start()` must remain backward compatible: existing calls `start(on_recycle=..., interval_s=...)` keep working unchanged.
@@ -1338,7 +1338,7 @@ Metrics keys are `rss_mb`, `threads`, `fds`, `fd_limit` (see `evaluate_threshold
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `. .venv/bin/activate; python3 -m unittest tests.test_monitor.test_monitor_fires_on_tick_each_interval -v`
+Run: `. .venv/bin/activate; python3 -m pytest tests/test_monitor.py::test_monitor_fires_on_tick_each_interval -q`
 Expected: FAIL — `start()` got an unexpected keyword argument `on_tick`.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -1405,7 +1405,7 @@ In `proxy.py` `main()`, add a plugin fan-out and pass it to `start()`. Replace t
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `. .venv/bin/activate; python3 -m unittest tests.test_monitor -v`
+Run: `. .venv/bin/activate; python3 -m pytest tests/test_monitor.py -q`
 Expected: PASS (new tests + all existing monitor tests, since `on_tick=None` preserves legacy behavior).
 
 - [ ] **Step 5: Commit**
@@ -1465,13 +1465,13 @@ In `plugin_info()` change `"version": "0.5.0"` to `"version": "0.6.0"`.
 
 - [ ] **Step 3: Run the full telegram + monitor suites**
 
-Run: `. .venv/bin/activate; python3 -m unittest tests.test_telegram tests.test_monitor -v 2>&1 | tail -15`
-Expected: `OK` — all tests pass.
+Run: `. .venv/bin/activate; python3 -m pytest tests/test_telegram.py tests/test_monitor.py -q 2>&1 | tail -15`
+Expected: all tests pass.
 
 - [ ] **Step 4: Run the broader suite to catch regressions**
 
-Run: `. .venv/bin/activate; python3 -m unittest tests.test_proxy tests.test_status_endpoint -v 2>&1 | tail -15`
-Expected: `OK` (these exercise the monitor/proxy wiring touched in Task 12).
+Run: `. .venv/bin/activate; python3 -m pytest tests/test_proxy.py tests/test_status_endpoint.py -q 2>&1 | tail -15`
+Expected: all pass (these exercise the monitor/proxy wiring touched in Task 12).
 
 - [ ] **Step 5: Commit**
 

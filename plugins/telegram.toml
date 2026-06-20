@@ -27,10 +27,42 @@ chat_id   = "-5123265276"
 # tts_openai_api_key_env = "OPENAI_API_KEY"
 
 # Remote approval via Telegram inline buttons.
-# Enable the callback poller that listens for Approve/Deny button presses.
-# Requires the PreToolUse hook script (hooks/telegram_approve.py).
+# Enable the callback poller that long-polls Telegram getUpdates. It listens
+# for Approve/Deny button presses AND for messages you type in the channel:
+# any plain message (not a /command) is forwarded to the running Claude Code
+# session, injected into its next request as a <system-reminder>. No Reply
+# button needed — just type and send. (Reaches the session on its next API
+# request; it does not wake a fully idle session.)
+# Requires the PreToolUse hook script (hooks/telegram_approve.py) for approvals.
 approval_poller = "true"
 
 # Scanner for the approval hook: "always" (ask for every tool call),
 # "leak-guard" (only when PII detected), "none" (disabled)
 approval_scanner = "always"
+
+# ── Session delivery ─────────────────────────────────────────────────────
+# How messages typed in the channel reach the running Claude Code session:
+#   "inject" (default) — queued and injected into the session's NEXT request
+#                        (works while a session is active; does not wake idle)
+#   "resume"           — actively delivered to the project via
+#                        `claude --continue`, waking idle sessions and
+#                        preserving conversation context
+delivery_mode = "inject"
+
+# Path to the Claude Code CLI (the proxy daemon's PATH may differ from your
+# shell; use an absolute path if `claude` is not found):
+# claude_bin = "claude"
+
+# Seconds before a headless delivery run is killed:
+# resume_timeout = 300
+
+# Max delivery attempts before moving a message to session-inbox/failed/:
+# resume_max_attempts = 3
+
+# Telegram commands (sent in the channel):
+#   /project                       show current target + override + recent cwds
+#   /project <path>                set sticky target (validated dir on host)
+#   /project <path> <prompt>       one-shot: deliver <prompt> to <path> now
+#   /project clear | /project off  clear sticky target
+# Plain (non-command) messages go to the default target:
+#   native reply-to > /project override > last-active project.
