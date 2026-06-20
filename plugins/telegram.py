@@ -50,11 +50,12 @@ _MSG_CWD_CAP = 500
 def _record_message_target(message_id: int | None, cwd: str) -> None:
     """Record which project cwd a sent Telegram message belongs to."""
     global _last_active_cwd
-    if cwd:
-        _last_active_cwd = cwd
-    if not message_id or not cwd:
+    if not cwd:
         return
     with _msg_cwd_lock:
+        _last_active_cwd = cwd
+        if not message_id:
+            return
         _msg_cwd[message_id] = cwd
         _msg_cwd.move_to_end(message_id)
         while len(_msg_cwd) > _MSG_CWD_CAP:
