@@ -38,6 +38,7 @@ _delivery_mode: str = "inject"   # "inject" | "resume"
 _claude_bin: str = "claude"
 _resume_timeout: int = 300
 _resume_max_attempts: int = 3
+_deliver_autonomous: bool = True
 _last_active_cwd: str | None = None
 
 MAX_TG_LENGTH = 4096
@@ -346,7 +347,7 @@ def _resolve_target(msg: dict) -> str | None:
 def plugin_info() -> dict:
     return {
         "name": "telegram",
-        "version": "0.6.0",
+        "version": "0.7.0",
         "description": "Telegram notifications with TTS audio fallback",
     }
 
@@ -357,7 +358,7 @@ def configure(config: dict) -> None:
     global _audio_threshold, _tts_engine, _voice_upload_timeout
     global _tts_openai_model, _tts_openai_voice, _tts_openai_api_key
     global _notify_on_recycle
-    global _delivery_mode, _claude_bin, _resume_timeout, _resume_max_attempts
+    global _delivery_mode, _claude_bin, _resume_timeout, _resume_max_attempts, _deliver_autonomous
 
     _project_name = config.get("project_name", "")  # explicit override only; dynamic cwd used at runtime
     _audio_threshold = int(config.get("audio_threshold", 8192))
@@ -376,6 +377,7 @@ def configure(config: dict) -> None:
     _claude_bin = config.get("claude_bin", "claude")
     _resume_timeout = int(config.get("resume_timeout", 300))
     _resume_max_attempts = int(config.get("resume_max_attempts", 3))
+    _deliver_autonomous = str(config.get("deliver_autonomous", "true")).lower() in ("true", "1", "yes", "on")
 
     # Credentials
     _bot_token = config.get("bot_token")
@@ -1058,6 +1060,63 @@ def _handle_option_callback(cb: dict, token: str, chat_id: str, option_index: st
     _log(f"option selected: {label[:40]}")
 
 
+def _handle_qopt_callback(cb: dict, token: str, chat_id: str, rest: str) -> None:
+    """Record an AskUserQuestion option pick; write decided when all answered."""
+    query_id = cb.get("id", "")
+    try:
+        did, q_idx, opt_idx = rest.split(":")
+    except ValueError:
+        return
+    pending_path = HOOK_DIR / "pending" / f"{did}.json"
+    decided_path = HOOK_DIR / "decided" / f"{did}.json"
+    if not pending_path.exists():
+        _answer_callback_query(token, query_id, "Decision expired")
+        return
+    try:
+        info = json.loads(pending_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    answered = info.get("answered", {})
+    answered[str(q_idx)] = int(opt_idx)
+    info["answered"] = answered
+    try:
+        pending_path.write_text(json.dumps(info))
+    except OSError:
+        pass
+    _answer_callback_query(token, query_id, "Recorded")
+    # show the pick on the message
+    msg = cb.get("message", {})
+    msg_id = msg.get("message_id")
+    label = "selected"
+    kb = msg.get("reply_markup", {}).get("inline_keyboard", [])
+    try:
+        label = kb[int(opt_idx)][0].get("text", label)
+    except (ValueError, IndexError):
+        pass
+    if msg_id:
+        try:
+            data = json.dumps({
+                "chat_id": chat_id, "message_id": msg_id,
+                "reply_markup": json.dumps({"inline_keyboard": [[
+                    {"text": f"✅ {label}", "callback_data": "noop:qopt"}]]}),
+            }).encode()
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
+                data=data, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:
+            pass
+    # all answered → write decided
+    if len(answered) >= int(info.get("n_questions", 1)):
+        try:
+            decided_path.write_text(json.dumps({
+                "answered": answered, "decided_at": time.time()}))
+            pending_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    _log(f"qopt {did[:8]} q{q_idx}={opt_idx} ({len(answered)}/{info.get('n_questions')})")
+
+
 def _handle_reply_callback(cb: dict, token: str, chat_id: str) -> None:
     """Handle Reply button press — set waiting state."""
     global _waiting_for_reply
@@ -1192,6 +1251,9 @@ def _handle_callback(cb: dict, token: str, chat_id: str) -> None:
         return
     if action == "option":
         _handle_option_callback(cb, token, chat_id, decision_id)
+        return
+    if action == "qopt":
+        _handle_qopt_callback(cb, token, chat_id, decision_id)
         return
 
     if action == "noop":
@@ -1433,8 +1495,12 @@ def _deliver_one(item_path: Path) -> None:
     try:
         env = os.environ.copy()
         env.setdefault("ANTHROPIC_BASE_URL", "http://127.0.0.1:18019")
+        cmd = [_claude_bin, "--continue", "--print", text]
+        if _deliver_autonomous:
+            cmd = [_claude_bin, "--continue", "--dangerously-skip-permissions",
+                   "--permission-mode", "acceptEdits", "--print", text]
         proc = subprocess.run(
-            [_claude_bin, "--continue", "--print", text],
+            cmd,
             cwd=cwd, capture_output=True, text=True, timeout=_resume_timeout,
             stdin=subprocess.DEVNULL,
             env=env,

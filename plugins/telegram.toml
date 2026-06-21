@@ -66,3 +66,14 @@ delivery_mode = "inject"
 #   /project clear | /project off  clear sticky target
 # Plain (non-command) messages go to the default target:
 #   native reply-to > /project override > last-active project.
+
+# ── Remote decisions (answer Claude's AskUserQuestion from Telegram) ──────
+# Requires the PreToolUse hook registered in settings.json:
+#   matcher "AskUserQuestion" -> python3 ~/.claude/claude-proxy/hooks/telegram_decide.py
+decide_route = "auto"     # "auto" (route only when away) | "always" | "off"
+decide_timeout = 600      # seconds the hook waits for a Telegram answer
+
+# Resume-delivery autonomy: run delivered `claude --continue` without tool-
+# approval prompts so headless tasks don't stall. AskUserQuestion decisions
+# still route to Telegram via the decide hook.
+deliver_autonomous = true

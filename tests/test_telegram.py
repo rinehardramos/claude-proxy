@@ -1722,6 +1722,71 @@ class TestDeliverer(unittest.TestCase):
             self.t._deliver_one(p)
         self.assertEqual(m.call_args.kwargs.get("stdin"), _sp.DEVNULL)
 
+    def test_deliver_autonomous_flags(self):
+        self.t._deliver_autonomous = True
+        p = self.t._inbox_put("x", self.cwd)
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")) as m:
+            self.t._deliver_one(p)
+        args = m.call_args[0][0]
+        self.assertIn("--dangerously-skip-permissions", args)
+        self.assertIn("--permission-mode", args)
+        self.assertIn("acceptEdits", args)
+
+    def test_deliver_non_autonomous_omits_flags(self):
+        self.t._deliver_autonomous = False
+        p = self.t._inbox_put("x", self.cwd)
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")) as m:
+            self.t._deliver_one(p)
+        self.assertNotIn("--dangerously-skip-permissions", m.call_args[0][0])
+
+
+class TestQoptCallback(unittest.TestCase):
+    def setUp(self):
+        self.t = _load()
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.t.HOOK_DIR = Path(self.tmp)
+        (Path(self.tmp) / "pending").mkdir()
+        (Path(self.tmp) / "decided").mkdir()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _pending(self, did, n):
+        p = Path(self.tmp) / "pending" / f"{did}.json"
+        p.write_text(json.dumps({"kind": "decide", "n_questions": n,
+                                 "message_ids": [1], "answered": {}}))
+        return p
+
+    def test_single_question_writes_decided(self):
+        self._pending("d1", 1)
+        cb = {"id": "q", "data": "qopt:d1:0:1", "message": {"message_id": 1}}
+        with patch("urllib.request.urlopen"):
+            self.t._handle_callback(cb, "tok", "chat")
+        decided = Path(self.tmp) / "decided" / "d1.json"
+        self.assertTrue(decided.exists())
+        self.assertEqual(json.loads(decided.read_text())["answered"], {"0": 1})
+
+    def test_two_questions_waits_for_both(self):
+        self._pending("d2", 2)
+        with patch("urllib.request.urlopen"):
+            self.t._handle_callback({"id": "q", "data": "qopt:d2:0:0",
+                                     "message": {"message_id": 1}}, "tok", "chat")
+        self.assertFalse((Path(self.tmp) / "decided" / "d2.json").exists())
+        with patch("urllib.request.urlopen"):
+            self.t._handle_callback({"id": "q", "data": "qopt:d2:1:1",
+                                     "message": {"message_id": 1}}, "tok", "chat")
+        decided = Path(self.tmp) / "decided" / "d2.json"
+        self.assertTrue(decided.exists())
+        self.assertEqual(json.loads(decided.read_text())["answered"], {"0": 0, "1": 1})
+
+    def test_unknown_decision_ignored(self):
+        cb = {"id": "q", "data": "qopt:nope:0:0", "message": {"message_id": 1}}
+        with patch("urllib.request.urlopen"):
+            self.t._handle_callback(cb, "tok", "chat")  # no crash
+        self.assertFalse((Path(self.tmp) / "decided" / "nope.json").exists())
+
 
 class TestPollerWatchdog(unittest.TestCase):
     def setUp(self):

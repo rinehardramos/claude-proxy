@@ -104,6 +104,24 @@ chat_id = "your-chat-id"
 # tts_openai_model = "tts-1"
 # tts_openai_voice = "alloy"
 # tts_openai_api_key_env = "OPENAI_API_KEY"
+
+# Remote decisions — answer Claude's AskUserQuestion from Telegram:
+# decide_route = "auto"              # "auto" (route only when away) | "always" | "off"
+# decide_timeout = 600               # seconds the hook waits for a Telegram answer
+# deliver_autonomous = true          # skip tool-approval prompts on headless resume delivery
+```
+
+#### Hook registration (AskUserQuestion → Telegram)
+
+To enable remote answering of Claude's `AskUserQuestion` prompts from Telegram,
+register the decide hook in your project's `.claude/settings.json`:
+
+```json
+{ "hooks": { "PreToolUse": [
+  { "matcher": "AskUserQuestion", "hooks": [
+    { "type": "command",
+      "command": "python3 ~/.claude/claude-proxy/hooks/telegram_decide.py",
+      "timeout": 600 } ] } ] } }
 ```
 
 ### task_watcher
