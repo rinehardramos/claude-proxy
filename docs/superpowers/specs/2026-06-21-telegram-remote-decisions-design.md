@@ -29,7 +29,7 @@ A **PreToolUse hook** on `AskUserQuestion` can return:
 
 Returning this **bypasses the local terminal menu** and feeds the answers to the model. `multiSelect` answers are arrays. This is the same hook IPC the existing `telegram_approve.py` uses (pending/decided files + the plugin's callback poller), with a richer return value.
 
-> **GATE — validation spike (must pass before building the rest):** the `updatedInput.answers` schema comes from documentation, not from running it on this machine's Claude Code build. Task 1 is a throwaway hook that hard-codes an answer for a one-question `AskUserQuestion` and confirms the model proceeds with it and no local menu appears. If it doesn't work, this design is revised before any further work.
+> **GATE — validation spike: PASSED (2026-06-21).** A throwaway PreToolUse hook returning `allow` + `updatedInput{questions, answers:{<q>: <first option label>}}` was run against a headless `claude -p` that called `AskUserQuestion`. The model proceeded with the injected answer (`PICKED=APPROACH_ALPHA`), no local menu, no hang. The hook received exactly this schema: `tool_input.questions[]` with `question`, `options[].label`, `multiSelect`. The mechanism is confirmed on this host's Claude Code build; the design stands.
 
 ## Scope (this spec)
 
@@ -37,7 +37,7 @@ Returning this **bypasses the local terminal menu** and feeds the answers to the
 - Remote answering of **`AskUserQuestion`** (1–4 questions, single-select per question).
 - **Session-aware gating**: route to Telegram only when "away"; otherwise let the local TUI handle it.
 - **Autonomy config** for the resume-delivery deliverer: run `claude` with `--dangerously-skip-permissions` (and `--permission-mode acceptEdits`) so headless deliveries don't block on tool-approval prompts — leaving only genuine `AskUserQuestion` decisions to route to Telegram.
-- Shared hook helper extracted so `telegram_approve.py` and `telegram_decide.py` don't duplicate Telegram/config code.
+- A self-contained shared hook helper `_tg_hook_common.py` that `telegram_decide.py` uses (so future hooks don't re-duplicate Telegram/config code). `telegram_approve.py` is left as-is for now (see Components).
 
 **Deferred (documented follow-on phases, not built here):**
 - **`ExitPlanMode`** remote approve/reject. Feasible via the same hook, but the **plan text is not in the PreToolUse input** (Claude Code injects it later), so showing the plan needs a transcript read — separate phase.
@@ -69,9 +69,9 @@ The hook and the plugin communicate only through files under `~/.claude/claude-p
 
 ## Components
 
-1. **`hooks/_tg_hook_common.py`** (new, stdlib only). Extracted from `telegram_approve.py`:
-   - `load_config()`, `_parse_toml()`, `tg_post(token, method, payload)`, `send_message(...)`, paths (`HOOK_DIR`, `PENDING_DIR`, `DECIDED_DIR`), and the session-aware gating helpers (`session_auto_approves`, `settings_default_mode`).
-   - `telegram_approve.py` is refactored to import these (no behavior change; its tests stay green).
+1. **`hooks/_tg_hook_common.py`** (new, stdlib only, **self-contained**).
+   - `load_config()`, `_parse_toml()`, `tg_post(token, method, payload)`, `send_message(...)`, paths (`HOOK_DIR`, `PENDING_DIR`, `DECIDED_DIR`), and the session-aware gating helpers (`session_auto_approves`, `settings_default_mode`) — implemented fresh here (small, stdlib).
+   - **`telegram_approve.py` is NOT modified by this feature.** It currently has uncommitted in-progress changes (session-aware permission work); refactoring it to import `_tg_hook_common` would entangle this feature with that WIP. Consolidating the two hooks onto the shared module is a **deferred follow-up** for after that WIP lands.
 
 2. **`hooks/telegram_decide.py`** (new PreToolUse hook). Pure-ish, stdlib only:
    - `main()`: read stdin; if `tool_name != "AskUserQuestion"` → emit nothing (let it pass). Phase 1 ignores `ExitPlanMode`.
@@ -102,7 +102,7 @@ decide_timeout = 600         # seconds the hook waits for a Telegram answer
 deliver_autonomous = true    # adds --dangerously-skip-permissions to the deliverer
 ```
 
-"Away" (for `decide_route="auto"`): the session's `permission_mode` is an auto-approving mode OR the `/mode` file is set to a remote-routing mode — reusing `telegram_approve.py`'s existing `session_auto_approves` logic. At the keyboard in default mode → local TUI.
+"Away" (for `decide_route="auto"`): the session's `permission_mode` is an auto-approving mode OR the `/mode` file is set to a remote-routing mode — using the same `session_auto_approves` logic (reimplemented in `_tg_hook_common.py`; the equivalent lives in `telegram_approve.py`'s in-progress changes). At the keyboard in default mode → local TUI.
 
 > **Note the deliberate inversion vs. the approve hook.** For `telegram_approve.py`, an auto-approving mode means "I granted autonomy — *don't* bug me on Telegram for permissions." For the decide hook it means the opposite: an autonomous/away session *can't* answer a genuine decision locally, so the decision *must* go to Telegram. Same signal, complementary routing — this is intended, not a contradiction.
 
@@ -137,7 +137,7 @@ Unit (stdlib, no network):
 - `build_question_messages`: single-select → N buttons with correct `qopt:` callback_data; multiSelect present → sentinel (fall back).
 - `assemble_answers`: maps qIdx/optIdx back to `{question_text: option_label}`; multiSelect would be a list (deferred).
 - `_handle_qopt_callback`: records into pending; writes decided only when all answered; idempotent on re-tap.
-- `_tg_hook_common` extraction: `telegram_approve.py`'s existing tests stay green after refactor.
+- `_tg_hook_common`: config parse, `tg_post`/`send_message` payload shape (mocked urlopen), `session_auto_approves` gate. `telegram_approve.py` is untouched, so its tests are unaffected.
 - deliverer: `_deliver_one` includes `--dangerously-skip-permissions` when `deliver_autonomous`, omits it when false.
 
 Integration / manual (the gate):
