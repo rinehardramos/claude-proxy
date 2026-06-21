@@ -84,7 +84,8 @@ The hook and the plugin communicate only through files under `~/.claude/claude-p
    - Parse `qopt:<decision_id>:<qIdx>:<optIdx>`; load `pending/<decision_id>.json`; record `answered[qIdx]=optIdx`; if `len(answered)==n_questions` → write `decided/<decision_id>.json`; ack + edit the message to show the chosen option.
    - *Unit:* `_handle_qopt_callback(cb, token, chat_id, payload)`.
 
-4. **Deliverer autonomy** (`plugins/telegram.py` `_deliver_one`): when `deliver_autonomous` config is true (default true), the `claude` command gains `--dangerously-skip-permissions` and `--permission-mode acceptEdits`. So a resume-delivered task runs to completion autonomously, and any `AskUserQuestion` it raises is answered via the decide hook (which works even in `--print` mode, since the hook supplies the answer).
+4. **Deliverer autonomy** (`plugins/telegram.py` `_deliver_one`): when `deliver_autonomous` config is true (default true), the `claude` command gains `--dangerously-skip-permissions`. So a resume-delivered task runs to completion autonomously, and any `AskUserQuestion` it raises is answered via the decide hook (which works even in `--print` mode, since the hook supplies the answer).
+   - **Verify during implementation:** whether `--dangerously-skip-permissions` and `--permission-mode acceptEdits` can be passed together (they may be mutually exclusive). `--dangerously-skip-permissions` already bypasses *all* tool-permission prompts, so it subsumes `acceptEdits`; the plan should pass the single flag unless the spike shows `acceptEdits` is separately needed.
 
 5. **Registration**: `PreToolUse` matcher `AskUserQuestion` → `python3 ~/.claude/claude-proxy/hooks/telegram_decide.py`, timeout 600. Documented + added by the setup/install path.
 
@@ -98,10 +99,12 @@ decide_timeout = 600         # seconds the hook waits for a Telegram answer
 # Resume-delivery autonomy: run delivered `claude --continue` without tool-approval
 # prompts so headless tasks don't stall. Genuine AskUserQuestion decisions still
 # route to Telegram via the decide hook.
-deliver_autonomous = true    # adds --dangerously-skip-permissions --permission-mode acceptEdits
+deliver_autonomous = true    # adds --dangerously-skip-permissions to the deliverer
 ```
 
 "Away" (for `decide_route="auto"`): the session's `permission_mode` is an auto-approving mode OR the `/mode` file is set to a remote-routing mode — reusing `telegram_approve.py`'s existing `session_auto_approves` logic. At the keyboard in default mode → local TUI.
+
+> **Note the deliberate inversion vs. the approve hook.** For `telegram_approve.py`, an auto-approving mode means "I granted autonomy — *don't* bug me on Telegram for permissions." For the decide hook it means the opposite: an autonomous/away session *can't* answer a genuine decision locally, so the decision *must* go to Telegram. Same signal, complementary routing — this is intended, not a contradiction.
 
 ## Data flow (single call, 2 questions)
 
@@ -135,7 +138,7 @@ Unit (stdlib, no network):
 - `assemble_answers`: maps qIdx/optIdx back to `{question_text: option_label}`; multiSelect would be a list (deferred).
 - `_handle_qopt_callback`: records into pending; writes decided only when all answered; idempotent on re-tap.
 - `_tg_hook_common` extraction: `telegram_approve.py`'s existing tests stay green after refactor.
-- deliverer: `_deliver_one` includes `--dangerously-skip-permissions --permission-mode acceptEdits` when `deliver_autonomous`.
+- deliverer: `_deliver_one` includes `--dangerously-skip-permissions` when `deliver_autonomous`, omits it when false.
 
 Integration / manual (the gate):
 - **Task 1 spike**: hard-coded-answer hook proves `updatedInput.answers` works on this CLI build and suppresses the local menu.
