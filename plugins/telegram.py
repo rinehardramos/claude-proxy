@@ -1058,6 +1058,63 @@ def _handle_option_callback(cb: dict, token: str, chat_id: str, option_index: st
     _log(f"option selected: {label[:40]}")
 
 
+def _handle_qopt_callback(cb: dict, token: str, chat_id: str, rest: str) -> None:
+    """Record an AskUserQuestion option pick; write decided when all answered."""
+    query_id = cb.get("id", "")
+    try:
+        did, q_idx, opt_idx = rest.split(":")
+    except ValueError:
+        return
+    pending_path = HOOK_DIR / "pending" / f"{did}.json"
+    decided_path = HOOK_DIR / "decided" / f"{did}.json"
+    if not pending_path.exists():
+        _answer_callback_query(token, query_id, "Decision expired")
+        return
+    try:
+        info = json.loads(pending_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    answered = info.get("answered", {})
+    answered[str(q_idx)] = int(opt_idx)
+    info["answered"] = answered
+    try:
+        pending_path.write_text(json.dumps(info))
+    except OSError:
+        pass
+    _answer_callback_query(token, query_id, "Recorded")
+    # show the pick on the message
+    msg = cb.get("message", {})
+    msg_id = msg.get("message_id")
+    label = "selected"
+    kb = msg.get("reply_markup", {}).get("inline_keyboard", [])
+    try:
+        label = kb[int(opt_idx)][0].get("text", label)
+    except (ValueError, IndexError):
+        pass
+    if msg_id:
+        try:
+            data = json.dumps({
+                "chat_id": chat_id, "message_id": msg_id,
+                "reply_markup": json.dumps({"inline_keyboard": [[
+                    {"text": f"✅ {label}", "callback_data": "noop:qopt"}]]}),
+            }).encode()
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
+                data=data, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:
+            pass
+    # all answered → write decided
+    if len(answered) >= int(info.get("n_questions", 1)):
+        try:
+            decided_path.write_text(json.dumps({
+                "answered": answered, "decided_at": time.time()}))
+            pending_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    _log(f"qopt {did[:8]} q{q_idx}={opt_idx} ({len(answered)}/{info.get('n_questions')})")
+
+
 def _handle_reply_callback(cb: dict, token: str, chat_id: str) -> None:
     """Handle Reply button press — set waiting state."""
     global _waiting_for_reply
@@ -1192,6 +1249,9 @@ def _handle_callback(cb: dict, token: str, chat_id: str) -> None:
         return
     if action == "option":
         _handle_option_callback(cb, token, chat_id, decision_id)
+        return
+    if action == "qopt":
+        _handle_qopt_callback(cb, token, chat_id, decision_id)
         return
 
     if action == "noop":
