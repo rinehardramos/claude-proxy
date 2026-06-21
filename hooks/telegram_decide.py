@@ -81,17 +81,24 @@ def main() -> None:
     if not questions or has_multiselect(questions):
         _emit_nothing()  # Phase 1: don't answer multiSelect wrong
 
-    decision_id = uuid.uuid4().hex[:16]
+    decision_id = uuid.uuid4().hex  # FIX 3: full 32-char entropy
     timeout = int(config.get("decide_timeout", "600"))
     _common.PENDING_DIR.mkdir(parents=True, exist_ok=True)
     _common.DECIDED_DIR.mkdir(parents=True, exist_ok=True)
 
     msgs = build_question_messages(decision_id, questions)
+    # FIX 2: delete already-sent messages if a later send fails
     message_ids = []
     for msg in msgs:
         mid = _common.send_message(token, chat_id, msg["text"], msg["reply_markup"])
         if mid is None:
-            _emit_nothing()  # a send failed → local fallback
+            for prev in message_ids:
+                try:
+                    _common.tg_post(token, "deleteMessage",
+                                    {"chat_id": chat_id, "message_id": prev})
+                except Exception:
+                    pass
+            _emit_nothing()
         message_ids.append(mid)
 
     pending = _common.PENDING_DIR / f"{decision_id}.json"
@@ -103,28 +110,33 @@ def main() -> None:
         "created_at": time.time(),
     }))
 
-    decided = _common.DECIDED_DIR / f"{decision_id}.json"
+    # FIX 1: always unlink decided file once seen, regardless of parse/assemble outcome
+    decided_path = _common.DECIDED_DIR / f"{decision_id}.json"
     deadline = time.time() + timeout
+    answers = None
     while time.time() < deadline:
-        if decided.exists():
+        if decided_path.exists():
             try:
-                result = json.loads(decided.read_text())
-                answered = result.get("answered", {})
-                decided.unlink(missing_ok=True)
-                pending.unlink(missing_ok=True)
-                answers = assemble_answers(questions, answered)
-                print(json.dumps({"hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
-                    "updatedInput": {"questions": questions, "answers": answers},
-                }}))
-                sys.exit(0)
-            except (json.JSONDecodeError, OSError, KeyError, IndexError):
-                break
+                result = json.loads(decided_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                result = None
+            decided_path.unlink(missing_ok=True)  # always clean up once seen
+            if result is not None:
+                try:
+                    answers = assemble_answers(questions, result.get("answered", {}))
+                except (KeyError, IndexError, TypeError):
+                    answers = None
+            break
         time.sleep(2)
-
     pending.unlink(missing_ok=True)
-    _emit_nothing()  # timeout → local TUI
+    if not answers:
+        _emit_nothing()  # timeout or unusable decision → local fallback
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "updatedInput": {"questions": questions, "answers": answers},
+    }}))
+    sys.exit(0)
 
 
 if __name__ == "__main__":
