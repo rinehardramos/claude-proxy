@@ -1722,6 +1722,23 @@ class TestDeliverer(unittest.TestCase):
             self.t._deliver_one(p)
         self.assertEqual(m.call_args.kwargs.get("stdin"), _sp.DEVNULL)
 
+    def test_deliver_autonomous_flags(self):
+        self.t._deliver_autonomous = True
+        p = self.t._inbox_put("x", self.cwd)
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")) as m:
+            self.t._deliver_one(p)
+        args = m.call_args[0][0]
+        self.assertIn("--dangerously-skip-permissions", args)
+        self.assertIn("--permission-mode", args)
+        self.assertIn("acceptEdits", args)
+
+    def test_deliver_non_autonomous_omits_flags(self):
+        self.t._deliver_autonomous = False
+        p = self.t._inbox_put("x", self.cwd)
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")) as m:
+            self.t._deliver_one(p)
+        self.assertNotIn("--dangerously-skip-permissions", m.call_args[0][0])
+
 
 class TestQoptCallback(unittest.TestCase):
     def setUp(self):
