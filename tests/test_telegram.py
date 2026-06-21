@@ -1588,6 +1588,32 @@ class TestPlainMessageRouting(unittest.TestCase):
         self.assertEqual(info["cwd"], "/home/u/projY")
         self.assertEqual(self.t._pending_replies, [])
 
+    def test_reply_button_routes_to_replied_project_in_resume_mode(self):
+        """Tapping 💬 Reply on a project's notification, then typing, delivers to
+        THAT project's inbox in resume mode — not the active session."""
+        self.t._delivery_mode = "resume"
+        self.t._last_active_cwd = "/home/u/other"  # must NOT win
+        self.t._record_message_target(42, "/home/u/projReplied")
+        with patch("urllib.request.urlopen"):
+            self.t._handle_reply_callback(
+                {"id": "q", "message": {"message_id": 42}}, "tok", "chat")
+            self.t._handle_text_message({"text": "what's the status?"}, "tok", "chat")
+        items = self.t._inbox_list()
+        self.assertEqual(len(items), 1)
+        info = json.loads(items[0].read_text())
+        self.assertEqual(info["text"], "what's the status?")
+        self.assertEqual(info["cwd"], "/home/u/projReplied")
+        self.assertEqual(self.t._pending_replies, [])
+
+    def test_reply_button_inject_mode_still_queues(self):
+        self.t._delivery_mode = "inject"
+        with patch("urllib.request.urlopen"):
+            self.t._handle_reply_callback(
+                {"id": "q", "message": {"message_id": 1}}, "tok", "chat")
+            self.t._handle_text_message({"text": "hi"}, "tok", "chat")
+        self.assertEqual(self.t._pending_replies, ["hi"])
+        self.assertEqual(self.t._inbox_list(), [])
+
     def test_inject_mode_still_queues(self):
         self.t._delivery_mode = "inject"
         with patch("urllib.request.urlopen"):
