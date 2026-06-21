@@ -12,9 +12,9 @@
 
 - Hooks (`hooks/*.py`) are **standalone, stdlib only** — no imports from `proxy.py` or `plugins/`. They may import the sibling `hooks/_tg_hook_common.py`.
 - Test runner is **pytest** (in `.venv`): `. .venv/bin/activate` then `python3 -m pytest <path> -q`. Telegram tests are `unittest.TestCase`; hook tests in `tests/test_telegram_hook.py` are also unittest-style.
-- **GATE:** Task 1 (validation spike) must pass before Tasks 2–7. If the `updatedInput.answers` mechanism does not answer `AskUserQuestion` on this Claude Code build, STOP and revise the spec.
+- **GATE — ALREADY PASSED (2026-06-21):** Task 1 (validation spike) was run before this plan: a throwaway hook returning `allow`+`updatedInput.answers` made a headless `claude -p` proceed with the injected `AskUserQuestion` answer, no local menu. The mechanism is confirmed on this build. Task 1 below is retained for the record; the executor may skip straight to Task 2.
 - Hook output schema (exact): `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","updatedInput":{...}}}`. **Emitting no stdout** = default behavior (local TUI). Every failure/edge path emits nothing (never block the user).
-- Session-aware gating lives in `hooks/_tg_hook_common.py` (self-contained; do NOT depend on the uncommitted permission-mode WIP in `telegram_approve.py`).
+- Session-aware gating lives in `hooks/_tg_hook_common.py` (self-contained). **Do NOT modify or import `hooks/telegram_approve.py`** — it has uncommitted in-progress changes; this feature must not touch it. Re-implement the small session-gate logic fresh in `_tg_hook_common.py`.
 - `_AUTO_APPROVE_PERMISSION_MODES = frozenset({"acceptEdits","bypassPermissions","dontAsk","auto"})` (verbatim).
 - Shared IPC dir: `~/.claude/claude-proxy/telegram-hook/` with `pending/` and `decided/` subdirs (same as `telegram_approve.py`).
 - Callback data format for option buttons: `qopt:<decision_id>:<qIdx>:<optIdx>` (all ints except decision_id hex).
