@@ -98,6 +98,7 @@ _pending_replies: list[str] = []
 _pending_replies_lock = threading.Lock()
 _muted = False
 _waiting_for_reply = False  # True after user taps Reply button, awaiting text
+_waiting_for_reply_cwd: str | None = None  # project cwd of the replied-to notification
 _approval_mode = "ask"  # "ask" | "auto-approve" | "auto-deny"
 _MODE_FILE = HOOK_DIR / "mode"  # shared with telegram_approve.py hook script
 
@@ -902,7 +903,7 @@ def on_monitor_recycle(reason: str, value: int, threshold: int) -> None:
 
 def _handle_text_message(msg: dict, token: str, chat_id: str) -> None:
     """Handle incoming text messages: replies, /mute, /mode, /project commands."""
-    global _muted, _waiting_for_reply, _csm_waiting_reply_pid
+    global _muted, _waiting_for_reply, _waiting_for_reply_cwd, _csm_waiting_reply_pid
 
     text = msg.get("text", "").strip()
     if not text:
@@ -987,9 +988,22 @@ def _handle_text_message(msg: dict, token: str, chat_id: str) -> None:
         _log(f"session-monitor reply forwarded ({len(text)} chars, pid={pid})")
         return
 
-    # Waiting for reply text after user tapped Reply button
+    # Waiting for reply text after user tapped Reply button. Route it like any
+    # other message: in resume mode deliver to the replied-to project (or the
+    # resolved target) via the inbox; otherwise queue for on_outbound injection.
     if _waiting_for_reply:
         _waiting_for_reply = False
+        target = _waiting_for_reply_cwd or _resolve_target(msg)
+        _waiting_for_reply_cwd = None
+        if _delivery_mode == "resume" and target:
+            try:
+                _inbox_put(text, target)
+            except OSError as exc:
+                _log(f"inbox write failed ({exc}); falling back to inject queue")
+            else:
+                _send_text(token, chat_id, f"\u2705 Sent to {os.path.basename(target)}")
+                _log(f"reply \u2192 inbox for {target} ({len(text)} chars)")
+                return
         with _pending_replies_lock:
             _pending_replies.append(text)
         _send_text(token, chat_id, "\u2705 Reply queued")
@@ -1118,10 +1132,13 @@ def _handle_qopt_callback(cb: dict, token: str, chat_id: str, rest: str) -> None
 
 
 def _handle_reply_callback(cb: dict, token: str, chat_id: str) -> None:
-    """Handle Reply button press — set waiting state."""
-    global _waiting_for_reply
+    """Handle Reply button press — set waiting state, remember the project."""
+    global _waiting_for_reply, _waiting_for_reply_cwd
     query_id = cb.get("id", "")
     _waiting_for_reply = True
+    # Remember which project's notification this Reply was tapped on, so the
+    # typed reply can be delivered to THAT project in resume mode.
+    _waiting_for_reply_cwd = _cwd_for_message(cb.get("message", {}).get("message_id"))
     _answer_callback_query(token, query_id, "Type your reply:")
     _send_text(token, chat_id, "\U0001f4ac Type your reply:")
     _log("waiting for reply text")
