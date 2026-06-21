@@ -347,7 +347,7 @@ def _resolve_target(msg: dict) -> str | None:
 def plugin_info() -> dict:
     return {
         "name": "telegram",
-        "version": "0.6.0",
+        "version": "0.7.0",
         "description": "Telegram notifications with TTS audio fallback",
     }
 
