@@ -30,8 +30,12 @@ from typing import Any, Callable
 # ── Constants ──────────────────────────────────────────────────────────────
 
 LISTEN_PORT = int(os.environ.get("CLAUDE_PROXY_PORT", "18019"))
-UPSTREAM_HOST = "api.anthropic.com"
-UPSTREAM_PORT = 443
+UPSTREAM_HOST = os.environ.get("CLAUDE_PROXY_UPSTREAM_HOST", "api.anthropic.com")
+UPSTREAM_PORT = int(os.environ.get("CLAUDE_PROXY_UPSTREAM_PORT", "443"))
+UPSTREAM_TLS = os.environ.get("CLAUDE_PROXY_UPSTREAM_TLS", "true").lower() != "false"
+GEMINI_UPSTREAM_HOST = os.environ.get("CLAUDE_PROXY_GEMINI_UPSTREAM_HOST", "generativelanguage.googleapis.com")
+GEMINI_UPSTREAM_PORT = int(os.environ.get("CLAUDE_PROXY_GEMINI_UPSTREAM_PORT", "443"))
+GEMINI_UPSTREAM_TLS = os.environ.get("CLAUDE_PROXY_GEMINI_UPSTREAM_TLS", "true").lower() != "false"
 STATE_DIR = Path("~/.claude/claude-proxy").expanduser()
 PLUGINS_DIR = STATE_DIR / "plugins"
 PLUGINS_TOML = STATE_DIR / "plugins.toml"
@@ -741,16 +745,27 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         upstream_headers: dict[str, str] = {
             k: v for k, v in self.headers.items() if k.lower() not in skip
         }
-        upstream_headers["Host"] = UPSTREAM_HOST
         upstream_headers["Content-Length"] = str(len(body))
         upstream_headers["Accept-Encoding"] = "identity"
 
         is_stream = bool(payload.get("stream", False)) if payload else False
 
-        # Forward to Anthropic
+        # Select upstream based on request path
+        is_gemini = "/v1beta/models/" in self.path or "/v1/models/" in self.path
+        if is_gemini:
+            up_host, up_port, up_tls = GEMINI_UPSTREAM_HOST, GEMINI_UPSTREAM_PORT, GEMINI_UPSTREAM_TLS
+        else:
+            up_host, up_port, up_tls = UPSTREAM_HOST, UPSTREAM_PORT, UPSTREAM_TLS
+
+        upstream_headers["Host"] = up_host
+
+        # Forward to upstream
         try:
-            ctx = ssl.create_default_context()
-            conn = http.client.HTTPSConnection(UPSTREAM_HOST, UPSTREAM_PORT, context=ctx)
+            if up_tls:
+                ctx = ssl.create_default_context()
+                conn = http.client.HTTPSConnection(up_host, up_port, context=ctx)
+            else:
+                conn = http.client.HTTPConnection(up_host, up_port)
             conn.request(method, self.path, body=body, headers=upstream_headers)
             resp = conn.getresponse()
         except Exception:

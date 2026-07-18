@@ -1,0 +1,9 @@
+ARG PYTHON_VERSION=3.11
+FROM python:${PYTHON_VERSION}-slim
+
+WORKDIR /claude-proxy
+COPY proxy.py proxy.py
+COPY monitor.py monitor.py
+COPY tests/ tests/
+
+CMD ["python3", "tests/docker/tui_compat_test.py"]
